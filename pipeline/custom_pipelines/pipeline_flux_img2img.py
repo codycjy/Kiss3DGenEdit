@@ -612,6 +612,12 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        # Prompt-to-Prompt parameters
+        target_prompt: Optional[Union[str, List[str]]] = None,
+        target_prompt_2: Optional[Union[str, List[str]]] = None,
+        enable_prompt2prompt: bool = False,
+        p2p_replace_steps: float = 0.5,
+        p2p_blend_ratio: float = 0.8,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -747,6 +753,25 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             lora_scale=lora_scale,
         )
 
+        # Encode target prompt for prompt-to-prompt editing
+        target_prompt_embeds = None
+        target_pooled_prompt_embeds = None
+        if enable_prompt2prompt and target_prompt is not None:
+            (
+                target_prompt_embeds,
+                target_pooled_prompt_embeds,
+                _,  # text_ids are the same
+            ) = self.encode_prompt(
+                prompt=target_prompt,
+                prompt_2=target_prompt_2,
+                prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                lora_scale=lora_scale,
+            )
+
         # 4.Prepare timesteps
         image_seq_len = (int(height) // self.vae_scale_factor // 2) * (int(width) // self.vae_scale_factor // 2)
         mu = calculate_shift(
@@ -799,11 +824,51 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         else:
             guidance = None
 
+        # Setup prompt-to-prompt attention processor if enabled
+        p2p_processor = None
+        original_processors = None
+        if enable_prompt2prompt and target_prompt_embeds is not None:
+            from diffusers.models.attention_processor import FluxPrompt2PromptAttnProcessor
+
+            # Create and configure prompt-to-prompt processor
+            p2p_processor = FluxPrompt2PromptAttnProcessor()
+            p2p_processor.num_steps = len(timesteps)
+            p2p_processor.replace_steps = p2p_replace_steps
+            p2p_processor.blend_ratio = p2p_blend_ratio
+            p2p_processor.mode = 'store'  # First pass: store attention
+
+            # Save original processors and set new one
+            original_processors = self.transformer.attn_processors
+            self.transformer.set_attn_processor(p2p_processor)
+
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # Prompt-to-Prompt: Select prompt based on current step
+                current_prompt_embeds = prompt_embeds
+                current_pooled_embeds = pooled_prompt_embeds
+
+                if p2p_processor is not None:
+                    # Update processor step counter
+                    p2p_processor.cur_step = i
+                    p2p_processor.layer_idx = 0  # Reset for each timestep
+
+                    # Determine which prompt to use based on progress
+                    progress = i / max(len(timesteps) - 1, 1)
+
+                    if progress < p2p_replace_steps:
+                        # Store phase: use source prompt
+                        p2p_processor.mode = 'store'
+                        current_prompt_embeds = prompt_embeds
+                        current_pooled_embeds = pooled_prompt_embeds
+                    else:
+                        # Edit phase: use target prompt with stored attention
+                        p2p_processor.mode = 'edit'
+                        current_prompt_embeds = target_prompt_embeds
+                        current_pooled_embeds = target_pooled_prompt_embeds
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -811,13 +876,17 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
                     hidden_states=latents,
                     timestep=timestep / 1000,
                     guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=current_pooled_embeds,
+                    encoder_hidden_states=current_prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
+
+                # Increment layer counter for next transformer block
+                if p2p_processor is not None:
+                    p2p_processor.layer_idx += 1
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
@@ -843,6 +912,10 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+
+        # Restore original attention processors
+        if p2p_processor is not None and original_processors is not None:
+            self.transformer.set_attn_processor(original_processors)
 
         if output_type == "latent":
             image = latents

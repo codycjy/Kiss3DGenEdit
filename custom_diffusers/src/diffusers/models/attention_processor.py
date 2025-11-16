@@ -2159,6 +2159,160 @@ class FluxAttnProcessor2_0:
             return hidden_states
 
 
+class FluxPrompt2PromptAttnProcessor:
+    """
+    Attention processor for Prompt-to-Prompt editing with FLUX models.
+
+    This processor enables text-guided image editing by:
+    1. Storing attention maps from the source prompt generation
+    2. Blending stored attention with new attention during target prompt generation
+    3. Controlling when to switch from source to target prompt via timestep thresholds
+
+    Based on "Prompt-to-Prompt Image Editing with Cross Attention Control" (Hertz et al., 2022)
+    Adapted for FLUX's MMDiT architecture with joint text-image attention.
+    """
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("FluxPrompt2PromptAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+
+        # Attention storage
+        self.attention_store = {}
+
+        # Control parameters
+        self.cur_step = 0
+        self.num_steps = 0
+        self.replace_steps = 0.5  # Timestep threshold for switching prompts
+        self.blend_ratio = 0.8  # How much of stored attention to use
+
+        # Layer identification
+        self.layer_idx = 0
+
+        # Mode: 'store' or 'edit'
+        self.mode = 'store'
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.FloatTensor:
+        batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+
+        # `sample` projections.
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # Handle cross-attention with prompt-to-prompt control
+        if encoder_hidden_states is not None:
+            # `context` projections.
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+
+            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+
+            if attn.norm_added_q is not None:
+                encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
+            if attn.norm_added_k is not None:
+                encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
+
+            # Concatenate text and image tokens
+            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
+            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
+            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
+
+        if image_rotary_emb is not None:
+            from .embeddings import apply_rotary_emb
+
+            query = apply_rotary_emb(query, image_rotary_emb)
+            key = apply_rotary_emb(key, image_rotary_emb)
+
+        # Prompt-to-Prompt: Store or blend attention for cross-attention layers
+        if encoder_hidden_states is not None:
+            # Manual attention computation for prompt-to-prompt control
+            scale = 1.0 / math.sqrt(head_dim)
+            attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+            attention_probs = F.softmax(attention_scores, dim=-1)
+
+            # Create layer key for storage
+            layer_key = f"step_{self.cur_step}_layer_{self.layer_idx}"
+
+            # Determine if we should use stored attention
+            progress = self.cur_step / max(self.num_steps - 1, 1)
+
+            if self.mode == 'store':
+                # Store attention maps during source prompt generation
+                self.attention_store[layer_key] = attention_probs.detach().clone()
+            elif self.mode == 'edit' and progress >= self.replace_steps:
+                # Blend with stored attention during target prompt generation
+                if layer_key in self.attention_store:
+                    stored_attention = self.attention_store[layer_key]
+                    attention_probs = self.blend_ratio * stored_attention + (1 - self.blend_ratio) * attention_probs
+
+            # Apply attention
+            hidden_states = torch.matmul(attention_probs, value)
+        else:
+            # Use Flash Attention for self-attention (no prompt-to-prompt control)
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = (
+                hidden_states[:, : encoder_hidden_states.shape[1]],
+                hidden_states[:, encoder_hidden_states.shape[1] :],
+            )
+
+            # linear proj
+            hidden_states = attn.to_out[0](hidden_states)
+            # dropout
+            hidden_states = attn.to_out[1](hidden_states)
+
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+    def reset(self):
+        """Reset attention store for new generation"""
+        self.attention_store.clear()
+        self.cur_step = 0
+        self.layer_idx = 0
+
+    def set_mode(self, mode: str):
+        """Set processor mode: 'store' or 'edit'"""
+        assert mode in ['store', 'edit'], f"Mode must be 'store' or 'edit', got {mode}"
+        self.mode = mode
+
+
 class FluxAttnProcessor2_0_NPU:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
 

@@ -433,6 +433,131 @@ class kiss3d_wrapper(object):
 
         return gen_3d_bundle_image_
 
+    def generate_3d_bundle_image_prompt2prompt(
+        self,
+        source_prompt,
+        target_prompt,
+        image,
+        source_prompt_2=None,
+        target_prompt_2=None,
+        strength=0.95,
+        control_image=[],
+        control_mode=[],
+        control_guidance_start=None,
+        control_guidance_end=None,
+        controlnet_conditioning_scale=None,
+        p2p_replace_steps=0.5,
+        p2p_blend_ratio=0.8,
+        lora_scale=1.0,
+        num_inference_steps=None,
+        seed=None,
+        redux_hparam=None,
+        save_intermediate_results=True,
+        **kwargs
+    ):
+        """
+        Generate 3D bundle image using Prompt-to-Prompt editing.
+
+        Args:
+            source_prompt (str): The original prompt describing the source image/concept
+            target_prompt (str): The target prompt for editing
+            image (Tensor): Reference 3D bundle image, shape (3, 1024, 2048) or (1, 3, 1024, 2048)
+            source_prompt_2 (str, optional): Source prompt for second text encoder
+            target_prompt_2 (str, optional): Target prompt for second text encoder
+            strength (float): Denoising strength (default: 0.95)
+            control_image (list): List of control images for ControlNet
+            control_mode (list): List of control modes (e.g., ['tile', 'blur'])
+            p2p_replace_steps (float): Timestep threshold for switching from source to target (0-1, default: 0.5)
+            p2p_blend_ratio (float): Ratio of stored attention to blend (0-1, default: 0.8)
+            lora_scale (float): LoRA scale for FLUX model
+            num_inference_steps (int, optional): Number of denoising steps
+            seed (int, optional): Random seed
+            redux_hparam (dict, optional): Parameters for FLUX Redux
+            save_intermediate_results (bool): Whether to save intermediate images
+            **kwargs: Additional parameters for the pipeline
+
+        Returns:
+            gen_3d_bundle_image (Tensor): Generated 3D bundle image, shape (3, 1024, 2048)
+            save_path (str, optional): Path where the image is saved (if save_intermediate_results=True)
+        """
+        # Prepare generator
+        if seed is None:
+            seed = random.randint(0, 2**32 - 1)
+        generator = torch.Generator(device=self.flux_device).manual_seed(seed)
+
+        # Handle input image shape
+        if image.ndim == 3:
+            image = image.unsqueeze(0)  # (1, 3, 1024, 2048)
+
+        # Build base parameters
+        hparam_dict = {
+            'prompt': source_prompt,
+            'prompt_2': source_prompt_2,
+            'target_prompt': target_prompt,
+            'target_prompt_2': target_prompt_2,
+            'enable_prompt2prompt': True,
+            'p2p_replace_steps': p2p_replace_steps,
+            'p2p_blend_ratio': p2p_blend_ratio,
+            'image': image,
+            'strength': strength,
+            'num_inference_steps': num_inference_steps or self.flux_num_inference_steps,
+            'guidance_scale': 3.5,
+            'num_images_per_prompt': 1,
+            'width': 2048,
+            'height': 1024,
+            'output_type': 'np',
+            'generator': generator,
+            'joint_attention_kwargs': {"scale": lora_scale}
+        }
+        hparam_dict.update(kwargs)
+
+        # Handle Redux if provided
+        if redux_hparam is not None:
+            assert self.flux_redux_pipeline is not None
+            assert 'image' in redux_hparam.keys()
+            redux_hparam_ = {
+                'prompt': hparam_dict.pop('prompt'),
+                'prompt_2': hparam_dict.pop('prompt_2'),
+            }
+            redux_hparam_.update(redux_hparam)
+
+            with self.context():
+                redux_output = self.flux_redux_pipeline(**redux_hparam_)
+
+            hparam_dict.update(redux_output)
+
+        # Handle ControlNet if provided
+        if len(control_image) > 0:
+            assert isinstance(self.flux_pipeline, FluxControlNetImg2ImgPipeline)
+            assert len(control_mode) == len(control_image)
+
+            flux_ctrl_net = self.flux_pipeline.controlnet.nets[0]
+            self.flux_pipeline.controlnet = FluxMultiControlNetModel([flux_ctrl_net for _ in control_mode])
+
+            ctrl_hparams = {
+                'control_mode': [control_mode_dict[mode_] for mode_ in control_mode],
+                'control_image': control_image,
+                'control_guidance_start': control_guidance_start or [0.0 for _ in range(len(control_image))],
+                'control_guidance_end': control_guidance_end or [1.0 for _ in range(len(control_image))],
+                'controlnet_conditioning_scale': controlnet_conditioning_scale or [1.0 for _ in range(len(control_image))],
+            }
+
+            hparam_dict.update(ctrl_hparams)
+
+        # Generate with prompt-to-prompt
+        with self.context():
+            gen_3d_bundle_image = self.flux_pipeline(**hparam_dict).images
+
+        gen_3d_bundle_image_ = torch.from_numpy(gen_3d_bundle_image).squeeze(0).permute(2, 0, 1).contiguous().float()
+
+        if save_intermediate_results:
+            save_path = os.path.join(TMP_DIR, f'{self.uuid}_p2p_gen_3d_bundle_image.png')
+            torchvision.utils.save_image(gen_3d_bundle_image_, save_path)
+            logger.info(f"Save prompt-to-prompt generated 3D bundle image to {save_path}")
+            return gen_3d_bundle_image_, save_path
+
+        return gen_3d_bundle_image_
+
     def preprocess_controlnet_cond_image(self, image, control_mode, save_intermediate_results=True, **kwargs):
         """
         image: Tensor of shape (c, h, w), range [0., 1.]
