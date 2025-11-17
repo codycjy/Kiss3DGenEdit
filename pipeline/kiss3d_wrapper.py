@@ -480,10 +480,14 @@ class kiss3d_wrapper(object):
             gen_3d_bundle_image (Tensor): Generated 3D bundle image, shape (3, 1024, 2048)
             save_path (str, optional): Path where the image is saved (if save_intermediate_results=True)
         """
-        # Prepare generator
+        # Get flux device and parameters
+        flux_device = self.config['flux'].get('device', 'cpu')
         if seed is None:
-            seed = random.randint(0, 2**32 - 1)
-        generator = torch.Generator(device=self.flux_device).manual_seed(seed)
+            seed = self.config['flux'].get('seed', 0)
+        if num_inference_steps is None:
+            num_inference_steps = self.config['flux'].get('num_inference_steps', 20)
+
+        generator = torch.Generator(device=flux_device).manual_seed(seed)
 
         # Handle input image shape
         if image.ndim == 3:
@@ -500,7 +504,7 @@ class kiss3d_wrapper(object):
             'p2p_blend_ratio': p2p_blend_ratio,
             'image': image,
             'strength': strength,
-            'num_inference_steps': num_inference_steps or self.flux_num_inference_steps,
+            'num_inference_steps': num_inference_steps,
             'guidance_scale': 3.5,
             'num_images_per_prompt': 1,
             'width': 2048,
@@ -530,6 +534,16 @@ class kiss3d_wrapper(object):
         if len(control_image) > 0:
             assert isinstance(self.flux_pipeline, FluxControlNetImg2ImgPipeline)
             assert len(control_mode) == len(control_image)
+
+            control_mode_dict = {
+                'canny': 0,
+                'tile': 1,
+                'depth': 2,
+                'blur': 3,
+                'pose': 4,
+                'gray': 5,
+                'lq': 6,
+            }
 
             flux_ctrl_net = self.flux_pipeline.controlnet.nets[0]
             self.flux_pipeline.controlnet = FluxMultiControlNetModel([flux_ctrl_net for _ in control_mode])

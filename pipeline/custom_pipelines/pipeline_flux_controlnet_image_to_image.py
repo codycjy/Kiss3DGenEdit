@@ -668,6 +668,12 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        # Prompt-to-Prompt parameters
+        target_prompt: Optional[Union[str, List[str]]] = None,
+        target_prompt_2: Optional[Union[str, List[str]]] = None,
+        enable_prompt2prompt: bool = False,
+        p2p_replace_steps: float = 0.5,
+        p2p_blend_ratio: float = 0.8,
     ):
         """
         Function invoked when calling the pipeline for generation.
@@ -791,6 +797,25 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
             lora_scale=lora_scale,
         )
 
+        # Encode target prompt for prompt-to-prompt if enabled
+        target_prompt_embeds = None
+        target_pooled_prompt_embeds = None
+        if enable_prompt2prompt and target_prompt is not None:
+            (
+                target_prompt_embeds,
+                target_pooled_prompt_embeds,
+                _,
+            ) = self.encode_prompt(
+                prompt=target_prompt,
+                prompt_2=target_prompt_2,
+                prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                lora_scale=lora_scale,
+            )
+
         init_image = self.image_processor.preprocess(image, height=height, width=width)
         init_image = init_image.to(dtype=torch.float32)
 
@@ -906,6 +931,19 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
             ]
             controlnet_keep.append(keeps[0] if isinstance(self.controlnet, FluxControlNetModel) else keeps)
 
+        # Setup prompt-to-prompt processor if enabled
+        p2p_processor = None
+        original_processors = None
+        if enable_prompt2prompt and target_prompt_embeds is not None:
+            from diffusers.models.attention_processor import FluxPrompt2PromptAttnProcessor
+            p2p_processor = FluxPrompt2PromptAttnProcessor()
+            p2p_processor.num_steps = len(timesteps)
+            p2p_processor.replace_steps = p2p_replace_steps
+            p2p_processor.blend_ratio = p2p_blend_ratio
+            p2p_processor.mode = 'store'
+            original_processors = self.transformer.attn_processors
+            self.transformer.set_attn_processor(p2p_processor)
+
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
@@ -913,6 +951,25 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # Handle prompt-to-prompt prompt switching
+                current_prompt_embeds = prompt_embeds
+                current_pooled_embeds = pooled_prompt_embeds
+                if p2p_processor is not None:
+                    p2p_processor.cur_step = i
+                    p2p_processor.layer_idx = 0
+                    progress = i / max(len(timesteps) - 1, 1)
+
+                    if progress < p2p_replace_steps:
+                        # Store attention from source prompt
+                        p2p_processor.mode = 'store'
+                        current_prompt_embeds = prompt_embeds
+                        current_pooled_embeds = pooled_prompt_embeds
+                    else:
+                        # Edit with target prompt
+                        p2p_processor.mode = 'edit'
+                        current_prompt_embeds = target_prompt_embeds
+                        current_pooled_embeds = target_pooled_prompt_embeds
 
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
@@ -939,8 +996,8 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                     conditioning_scale=cond_scale,
                     timestep=timestep / 1000,
                     guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=current_pooled_embeds,
+                    encoder_hidden_states=current_prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
@@ -956,8 +1013,8 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                     hidden_states=latents,
                     timestep=timestep / 1000,
                     guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=current_pooled_embeds,
+                    encoder_hidden_states=current_prompt_embeds,
                     controlnet_block_samples=controlnet_block_samples,
                     controlnet_single_block_samples=controlnet_single_block_samples,
                     txt_ids=text_ids,
@@ -987,6 +1044,10 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+
+        # Restore original attention processors
+        if p2p_processor is not None and original_processors is not None:
+            self.transformer.set_attn_processor(original_processors)
 
         if output_type == "latent":
             image = latents
