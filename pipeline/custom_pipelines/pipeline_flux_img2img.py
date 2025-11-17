@@ -618,6 +618,7 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         enable_prompt2prompt: bool = False,
         p2p_replace_steps: float = 0.5,
         p2p_blend_ratio: float = 0.8,
+        p2p_chunk_size: int = 512,  # Chunk size for memory-efficient attention
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -830,8 +831,8 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         if enable_prompt2prompt and target_prompt_embeds is not None:
             from diffusers.models.attention_processor import FluxPrompt2PromptAttnProcessor
 
-            # Create and configure prompt-to-prompt processor
-            p2p_processor = FluxPrompt2PromptAttnProcessor()
+            # Create and configure prompt-to-prompt processor with chunked attention
+            p2p_processor = FluxPrompt2PromptAttnProcessor(chunk_size=p2p_chunk_size)
             p2p_processor.num_steps = len(timesteps)
             p2p_processor.replace_steps = p2p_replace_steps
             p2p_processor.blend_ratio = p2p_blend_ratio

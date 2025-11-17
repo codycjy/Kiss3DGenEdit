@@ -448,6 +448,7 @@ class kiss3d_wrapper(object):
         controlnet_conditioning_scale=None,
         p2p_replace_steps=0.5,
         p2p_blend_ratio=0.8,
+        p2p_chunk_size=512,
         lora_scale=1.0,
         num_inference_steps=None,
         seed=None,
@@ -469,6 +470,7 @@ class kiss3d_wrapper(object):
             control_mode (list): List of control modes (e.g., ['tile', 'blur'])
             p2p_replace_steps (float): Timestep threshold for switching from source to target (0-1, default: 0.5)
             p2p_blend_ratio (float): Ratio of stored attention to blend (0-1, default: 0.8)
+            p2p_chunk_size (int): Chunk size for memory-efficient attention (default: 512)
             lora_scale (float): LoRA scale for FLUX model
             num_inference_steps (int, optional): Number of denoising steps
             seed (int, optional): Random seed
@@ -502,6 +504,7 @@ class kiss3d_wrapper(object):
             'enable_prompt2prompt': True,
             'p2p_replace_steps': p2p_replace_steps,
             'p2p_blend_ratio': p2p_blend_ratio,
+            'p2p_chunk_size': p2p_chunk_size,
             'image': image,
             'strength': strength,
             'num_inference_steps': num_inference_steps,

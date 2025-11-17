@@ -2172,7 +2172,7 @@ class FluxPrompt2PromptAttnProcessor:
     Adapted for FLUX's MMDiT architecture with joint text-image attention.
     """
 
-    def __init__(self):
+    def __init__(self, chunk_size=512):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxPrompt2PromptAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
@@ -2189,7 +2189,83 @@ class FluxPrompt2PromptAttnProcessor:
         self.layer_idx = 0
 
         # Mode: 'store' or 'edit'
+
+        # Memory optimization: chunk size for attention computation
+        self.chunk_size = chunk_size  # Process attention in chunks to reduce memory
         self.mode = 'store'
+
+    def chunked_attention_with_p2p(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        layer_key: str,
+        progress: float
+    ) -> torch.Tensor:
+        """
+        Memory-efficient chunked attention computation with prompt-to-prompt control.
+
+        Args:
+            query: [batch, heads, seq_len, head_dim]
+            key: [batch, heads, seq_len, head_dim]
+            value: [batch, heads, seq_len, head_dim]
+            scale: attention scale factor
+            layer_key: unique key for storing attention maps
+            progress: current denoising progress (0-1)
+
+        Returns:
+            hidden_states: [batch, heads, seq_len, head_dim]
+        """
+        batch_size, num_heads, seq_len, head_dim = query.shape
+        device = query.device
+        dtype = query.dtype
+
+        # Initialize output tensor
+        hidden_states = torch.zeros_like(query)
+
+        # Store or retrieve full attention map for blending (if needed)
+        full_attention_probs = None
+        stored_attention = None
+
+        if self.mode == 'edit' and progress >= self.replace_steps:
+            if layer_key in self.attention_store:
+                stored_attention = self.attention_store[layer_key]
+
+        # Process query in chunks to reduce memory
+        for i in range(0, seq_len, self.chunk_size):
+            chunk_end = min(i + self.chunk_size, seq_len)
+            query_chunk = query[:, :, i:chunk_end, :]  # [batch, heads, chunk_size, head_dim]
+
+            # Compute attention scores for this chunk
+            # [batch, heads, chunk_size, head_dim] @ [batch, heads, head_dim, seq_len]
+            # = [batch, heads, chunk_size, seq_len]
+            attention_scores = torch.matmul(query_chunk, key.transpose(-1, -2)) * scale
+            attention_probs = F.softmax(attention_scores, dim=-1)
+
+            # Apply prompt-to-prompt blending if in edit mode
+            if self.mode == 'edit' and stored_attention is not None and progress >= self.replace_steps:
+                stored_chunk = stored_attention[:, :, i:chunk_end, :]
+                attention_probs = self.blend_ratio * stored_chunk + (1 - self.blend_ratio) * attention_probs
+
+            # Store attention for this chunk if in store mode
+            if self.mode == 'store':
+                if full_attention_probs is None:
+                    full_attention_probs = torch.zeros(
+                        batch_size, num_heads, seq_len, seq_len,
+                        device=device, dtype=dtype
+                    )
+                full_attention_probs[:, :, i:chunk_end, :] = attention_probs.detach()
+
+            # Apply attention: [batch, heads, chunk_size, seq_len] @ [batch, heads, seq_len, head_dim]
+            # = [batch, heads, chunk_size, head_dim]
+            hidden_states[:, :, i:chunk_end, :] = torch.matmul(attention_probs, value)
+
+        # Store full attention map if in store mode
+        if self.mode == 'store' and full_attention_probs is not None:
+            self.attention_store[layer_key] = full_attention_probs
+
+        return hidden_states
 
     def __call__(
         self,
@@ -2253,28 +2329,24 @@ class FluxPrompt2PromptAttnProcessor:
 
         # Prompt-to-Prompt: Store or blend attention for cross-attention layers
         if encoder_hidden_states is not None:
-            # Manual attention computation for prompt-to-prompt control
+            # Use chunked attention computation for memory efficiency
             scale = 1.0 / math.sqrt(head_dim)
-            attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
-            attention_probs = F.softmax(attention_scores, dim=-1)
 
             # Create layer key for storage
             layer_key = f"step_{self.cur_step}_layer_{self.layer_idx}"
 
-            # Determine if we should use stored attention
+            # Determine current progress for P2P control
             progress = self.cur_step / max(self.num_steps - 1, 1)
 
-            if self.mode == 'store':
-                # Store attention maps during source prompt generation
-                self.attention_store[layer_key] = attention_probs.detach().clone()
-            elif self.mode == 'edit' and progress >= self.replace_steps:
-                # Blend with stored attention during target prompt generation
-                if layer_key in self.attention_store:
-                    stored_attention = self.attention_store[layer_key]
-                    attention_probs = self.blend_ratio * stored_attention + (1 - self.blend_ratio) * attention_probs
-
-            # Apply attention
-            hidden_states = torch.matmul(attention_probs, value)
+            # Compute attention using memory-efficient chunked method
+            hidden_states = self.chunked_attention_with_p2p(
+                query=query,
+                key=key,
+                value=value,
+                scale=scale,
+                layer_key=layer_key,
+                progress=progress
+            )
         else:
             # Use Flash Attention for self-attention (no prompt-to-prompt control)
             hidden_states = F.scaled_dot_product_attention(
