@@ -2205,6 +2205,7 @@ class FluxPrompt2PromptAttnProcessor:
     ) -> torch.Tensor:
         """
         Memory-efficient chunked attention computation with prompt-to-prompt control.
+        Uses chunked storage on CPU to minimize GPU memory usage.
 
         Args:
             query: [batch, heads, seq_len, head_dim]
@@ -2224,15 +2225,22 @@ class FluxPrompt2PromptAttnProcessor:
         # Initialize output tensor
         hidden_states = torch.zeros_like(query)
 
-        # Store or retrieve full attention map for blending (if needed)
-        full_attention_probs = None
-        stored_attention = None
+        # For store mode: prepare list to store chunks on CPU
+        attention_chunks_cpu = [] if self.mode == 'store' else None
 
+        # For edit mode: retrieve stored chunks if available
+        stored_chunks_cpu = None
         if self.mode == 'edit' and progress >= self.replace_steps:
             if layer_key in self.attention_store:
-                stored_attention = self.attention_store[layer_key]
+                stored_chunks_cpu = self.attention_store[layer_key]
+                # Debug log
+                if hasattr(self, '_debug_log') and self._debug_log:
+                    print(f"[P2P Edit] {layer_key}: loaded {len(stored_chunks_cpu)} chunks")
+            elif hasattr(self, '_debug_log') and self._debug_log:
+                print(f"[P2P Edit] {layer_key}: NOT FOUND in attention_store!")
 
         # Process query in chunks to reduce memory
+        chunk_idx = 0
         for i in range(0, seq_len, self.chunk_size):
             chunk_end = min(i + self.chunk_size, seq_len)
             query_chunk = query[:, :, i:chunk_end, :]  # [batch, heads, chunk_size, head_dim]
@@ -2244,26 +2252,28 @@ class FluxPrompt2PromptAttnProcessor:
             attention_probs = F.softmax(attention_scores, dim=-1)
 
             # Apply prompt-to-prompt blending if in edit mode
-            if self.mode == 'edit' and stored_attention is not None and progress >= self.replace_steps:
-                stored_chunk = stored_attention[:, :, i:chunk_end, :]
+            if self.mode == 'edit' and stored_chunks_cpu is not None and progress >= self.replace_steps:
+                # Load stored chunk from CPU to GPU
+                stored_chunk = stored_chunks_cpu[chunk_idx].to(device=device, dtype=dtype)
                 attention_probs = self.blend_ratio * stored_chunk + (1 - self.blend_ratio) * attention_probs
 
-            # Store attention for this chunk if in store mode
+            # Store attention chunk to CPU if in store mode
             if self.mode == 'store':
-                if full_attention_probs is None:
-                    full_attention_probs = torch.zeros(
-                        batch_size, num_heads, seq_len, seq_len,
-                        device=device, dtype=dtype
-                    )
-                full_attention_probs[:, :, i:chunk_end, :] = attention_probs.detach()
+                # Move to CPU immediately to free GPU memory
+                attention_chunks_cpu.append(attention_probs.detach().cpu())
 
             # Apply attention: [batch, heads, chunk_size, seq_len] @ [batch, heads, seq_len, head_dim]
             # = [batch, heads, chunk_size, head_dim]
             hidden_states[:, :, i:chunk_end, :] = torch.matmul(attention_probs, value)
 
-        # Store full attention map if in store mode
-        if self.mode == 'store' and full_attention_probs is not None:
-            self.attention_store[layer_key] = full_attention_probs
+            chunk_idx += 1
+
+        # Store chunks list if in store mode
+        if self.mode == 'store' and attention_chunks_cpu is not None:
+            self.attention_store[layer_key] = attention_chunks_cpu
+            # Debug log
+            if hasattr(self, '_debug_log') and self._debug_log:
+                print(f"[P2P Store] {layer_key}: stored {len(attention_chunks_cpu)} chunks")
 
         return hidden_states
 

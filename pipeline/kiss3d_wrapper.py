@@ -74,21 +74,33 @@ def init_wrapper_from_config(config_path):
         flux_pipe = FluxImg2ImgPipeline.from_single_file(flux_base_model_pth, torch_dtype=dtype_[flux_dtype], )
     else:
         flux_pipe = FluxImg2ImgPipeline.from_pretrained(flux_base_model_pth, torch_dtype=dtype_[flux_dtype])
-    
+
+    # Always keep the base FluxImg2ImgPipeline for prompt2prompt usage
+    flux_img2img_pipe = flux_pipe
+
     # load flux model and controlnet
+    flux_controlnet_pipe = None
     if flux_controlnet_pth is not None:
         flux_controlnet = FluxControlNetModel.from_pretrained(flux_controlnet_pth, torch_dtype=torch.bfloat16)
-        flux_pipe = convert_flux_pipeline(flux_pipe, FluxControlNetImg2ImgPipeline, controlnet=[flux_controlnet])
+        flux_controlnet_pipe = convert_flux_pipeline(flux_pipe, FluxControlNetImg2ImgPipeline, controlnet=[flux_controlnet])
 
-    flux_pipe.scheduler = FlowMatchHeunDiscreteScheduler.from_config(flux_pipe.scheduler.config)
-        
+    # Configure scheduler for both pipelines
+    flux_img2img_pipe.scheduler = FlowMatchHeunDiscreteScheduler.from_config(flux_img2img_pipe.scheduler.config)
+    if flux_controlnet_pipe is not None:
+        flux_controlnet_pipe.scheduler = FlowMatchHeunDiscreteScheduler.from_config(flux_controlnet_pipe.scheduler.config)
 
-    # breakpoint()
-    # load lora weights
+    # Load lora weights for both pipelines
     if not os.path.exists(flux_lora_pth):
         flux_lora_pth = hf_hub_download(repo_id="LTT/Kiss3DGen", filename="rgb_normal.safetensors", repo_type="model")
-    flux_pipe.load_lora_weights(flux_lora_pth)
-    flux_pipe.to(device=flux_device)
+    flux_img2img_pipe.load_lora_weights(flux_lora_pth)
+    flux_img2img_pipe.to(device=flux_device)
+
+    if flux_controlnet_pipe is not None:
+        flux_controlnet_pipe.load_lora_weights(flux_lora_pth)
+        flux_controlnet_pipe.to(device=flux_device)
+
+    # For backward compatibility, set flux_pipe to controlnet version if available, otherwise img2img
+    flux_pipe = flux_controlnet_pipe if flux_controlnet_pipe is not None else flux_img2img_pipe
 
     # load redux model
     flux_redux_pipe = None
@@ -162,6 +174,8 @@ def init_wrapper_from_config(config_path):
     return kiss3d_wrapper(
         config = config_,
         flux_pipeline = flux_pipe,
+        flux_img2img_pipeline = flux_img2img_pipe,
+        flux_controlnet_pipeline = flux_controlnet_pipe,
         flux_redux_pipeline=flux_redux_pipe,
         multiview_pipeline = multiview_pipeline,
         caption_processor = caption_processor,
@@ -188,17 +202,21 @@ class kiss3d_wrapper(object):
     def __init__(self,
         config: Dict,
         flux_pipeline: Union[FluxPipeline, FluxControlNetImg2ImgPipeline],
-        flux_redux_pipeline: FluxPriorReduxPipeline,
-        multiview_pipeline: DiffusionPipeline,
-        caption_processor: AutoProcessor,
-        caption_model: AutoModelForCausalLM,
-        reconstruction_model_config: Any,
-        reconstruction_model: Any,
+        flux_img2img_pipeline: FluxImg2ImgPipeline,
+        flux_controlnet_pipeline: FluxControlNetImg2ImgPipeline = None,
+        flux_redux_pipeline: FluxPriorReduxPipeline = None,
+        multiview_pipeline: DiffusionPipeline = None,
+        caption_processor: AutoProcessor = None,
+        caption_model: AutoModelForCausalLM = None,
+        reconstruction_model_config: Any = None,
+        reconstruction_model: Any = None,
         llm_model: AutoModelForCausalLM = None,
         llm_tokenizer: AutoTokenizer = None
     ):
         self.config = config
-        self.flux_pipeline = flux_pipeline
+        self.flux_pipeline = flux_pipeline  # For backward compatibility
+        self.flux_img2img_pipeline = flux_img2img_pipeline  # For prompt2prompt
+        self.flux_controlnet_pipeline = flux_controlnet_pipeline  # For controlnet
         self.flux_redux_pipeline = flux_redux_pipeline
         self.multiview_pipeline = multiview_pipeline
         self.caption_model = caption_model
@@ -441,11 +459,6 @@ class kiss3d_wrapper(object):
         source_prompt_2=None,
         target_prompt_2=None,
         strength=0.95,
-        control_image=[],
-        control_mode=[],
-        control_guidance_start=None,
-        control_guidance_end=None,
-        controlnet_conditioning_scale=None,
         p2p_replace_steps=0.5,
         p2p_blend_ratio=0.8,
         p2p_chunk_size=512,
@@ -457,7 +470,11 @@ class kiss3d_wrapper(object):
         **kwargs
     ):
         """
-        Generate 3D bundle image using Prompt-to-Prompt editing.
+        Generate 3D bundle image using Prompt-to-Prompt editing (pure img2img, no ControlNet).
+
+        This method uses FluxImg2ImgPipeline with Prompt2Prompt attention control to edit
+        the input image based on text prompts. It does NOT use ControlNet - for ControlNet
+        support, use generate_3d_bundle_image_controlnet() instead.
 
         Args:
             source_prompt (str): The original prompt describing the source image/concept
@@ -466,8 +483,6 @@ class kiss3d_wrapper(object):
             source_prompt_2 (str, optional): Source prompt for second text encoder
             target_prompt_2 (str, optional): Target prompt for second text encoder
             strength (float): Denoising strength (default: 0.95)
-            control_image (list): List of control images for ControlNet
-            control_mode (list): List of control modes (e.g., ['tile', 'blur'])
             p2p_replace_steps (float): Timestep threshold for switching from source to target (0-1, default: 0.5)
             p2p_blend_ratio (float): Ratio of stored attention to blend (0-1, default: 0.8)
             p2p_chunk_size (int): Chunk size for memory-efficient attention (default: 512)
@@ -533,37 +548,9 @@ class kiss3d_wrapper(object):
 
             hparam_dict.update(redux_output)
 
-        # Handle ControlNet if provided
-        if len(control_image) > 0:
-            assert isinstance(self.flux_pipeline, FluxControlNetImg2ImgPipeline)
-            assert len(control_mode) == len(control_image)
-
-            control_mode_dict = {
-                'canny': 0,
-                'tile': 1,
-                'depth': 2,
-                'blur': 3,
-                'pose': 4,
-                'gray': 5,
-                'lq': 6,
-            }
-
-            flux_ctrl_net = self.flux_pipeline.controlnet.nets[0]
-            self.flux_pipeline.controlnet = FluxMultiControlNetModel([flux_ctrl_net for _ in control_mode])
-
-            ctrl_hparams = {
-                'control_mode': [control_mode_dict[mode_] for mode_ in control_mode],
-                'control_image': control_image,
-                'control_guidance_start': control_guidance_start or [0.0 for _ in range(len(control_image))],
-                'control_guidance_end': control_guidance_end or [1.0 for _ in range(len(control_image))],
-                'controlnet_conditioning_scale': controlnet_conditioning_scale or [1.0 for _ in range(len(control_image))],
-            }
-
-            hparam_dict.update(ctrl_hparams)
-
-        # Generate with prompt-to-prompt
+        # Generate with prompt-to-prompt using FluxImg2ImgPipeline (no ControlNet)
         with self.context():
-            gen_3d_bundle_image = self.flux_pipeline(**hparam_dict).images
+            gen_3d_bundle_image = self.flux_img2img_pipeline(**hparam_dict).images
 
         gen_3d_bundle_image_ = torch.from_numpy(gen_3d_bundle_image).squeeze(0).permute(2, 0, 1).contiguous().float()
 

@@ -837,10 +837,12 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             p2p_processor.replace_steps = p2p_replace_steps
             p2p_processor.blend_ratio = p2p_blend_ratio
             p2p_processor.mode = 'store'  # First pass: store attention
+            p2p_processor._debug_log = True  # Enable debug logging
 
             # Save original processors and set new one
             original_processors = self.transformer.attn_processors
             self.transformer.set_attn_processor(p2p_processor)
+            print(f"[P2P Init] Enabled with {len(timesteps)} steps, replace_steps={p2p_replace_steps}, blend_ratio={p2p_blend_ratio}")
 
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -865,11 +867,13 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
                         p2p_processor.mode = 'store'
                         current_prompt_embeds = prompt_embeds
                         current_pooled_embeds = pooled_prompt_embeds
+                        print(f"[P2P Step {i}/{len(timesteps)-1}] Mode: STORE, Progress: {progress:.3f}")
                     else:
                         # Edit phase: use target prompt with stored attention
                         p2p_processor.mode = 'edit'
                         current_prompt_embeds = target_prompt_embeds
                         current_pooled_embeds = target_pooled_prompt_embeds
+                        print(f"[P2P Step {i}/{len(timesteps)-1}] Mode: EDIT, Progress: {progress:.3f}")
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -916,6 +920,7 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
 
         # Restore original attention processors
         if p2p_processor is not None and original_processors is not None:
+            print(f"[P2P Summary] Total layers stored: {len(p2p_processor.attention_store)}")
             self.transformer.set_attn_processor(original_processors)
 
         if output_type == "latent":

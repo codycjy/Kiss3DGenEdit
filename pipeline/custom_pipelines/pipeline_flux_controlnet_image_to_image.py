@@ -801,11 +801,12 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
         # Encode target prompt for prompt-to-prompt if enabled
         target_prompt_embeds = None
         target_pooled_prompt_embeds = None
+        target_text_ids = None
         if enable_prompt2prompt and target_prompt is not None:
             (
                 target_prompt_embeds,
                 target_pooled_prompt_embeds,
-                _,
+                target_text_ids,
             ) = self.encode_prompt(
                 prompt=target_prompt,
                 prompt_2=target_prompt_2,
@@ -942,8 +943,10 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
             p2p_processor.replace_steps = p2p_replace_steps
             p2p_processor.blend_ratio = p2p_blend_ratio
             p2p_processor.mode = 'store'
+            p2p_processor._debug_log = True  # Enable debug logging
             original_processors = self.transformer.attn_processors
             self.transformer.set_attn_processor(p2p_processor)
+            print(f"[P2P Init] Enabled with {len(timesteps)} steps, replace_steps={p2p_replace_steps}, blend_ratio={p2p_blend_ratio}")
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
@@ -956,6 +959,7 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                 # Handle prompt-to-prompt prompt switching
                 current_prompt_embeds = prompt_embeds
                 current_pooled_embeds = pooled_prompt_embeds
+                current_text_ids = text_ids
                 if p2p_processor is not None:
                     p2p_processor.cur_step = i
                     p2p_processor.layer_idx = 0
@@ -966,11 +970,15 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                         p2p_processor.mode = 'store'
                         current_prompt_embeds = prompt_embeds
                         current_pooled_embeds = pooled_prompt_embeds
+                        current_text_ids = text_ids
+                        print(f"[P2P Step {i}/{len(timesteps)-1}] Mode: STORE, Progress: {progress:.3f}")
                     else:
                         # Edit with target prompt
                         p2p_processor.mode = 'edit'
                         current_prompt_embeds = target_prompt_embeds
                         current_pooled_embeds = target_pooled_prompt_embeds
+                        current_text_ids = target_text_ids
+                        print(f"[P2P Step {i}/{len(timesteps)-1}] Mode: EDIT, Progress: {progress:.3f}")
 
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
@@ -999,7 +1007,7 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                     guidance=guidance,
                     pooled_projections=current_pooled_embeds,
                     encoder_hidden_states=current_prompt_embeds,
-                    txt_ids=text_ids,
+                    txt_ids=current_text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
@@ -1018,11 +1026,15 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
                     encoder_hidden_states=current_prompt_embeds,
                     controlnet_block_samples=controlnet_block_samples,
                     controlnet_single_block_samples=controlnet_single_block_samples,
-                    txt_ids=text_ids,
+                    txt_ids=current_text_ids,
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
+
+                # Increment layer counter for next transformer block
+                if p2p_processor is not None:
+                    p2p_processor.layer_idx += 1
 
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -1048,6 +1060,7 @@ class FluxControlNetImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, From
 
         # Restore original attention processors
         if p2p_processor is not None and original_processors is not None:
+            print(f"[P2P Summary] Total layers stored: {len(p2p_processor.attention_store)}")
             self.transformer.set_attn_processor(original_processors)
 
         if output_type == "latent":

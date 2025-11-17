@@ -22,25 +22,29 @@ def run_prompt2prompt_edit(
     input_image_path,
     source_prompt,
     target_prompt,
-    use_controlnet=True,
     p2p_replace_steps=0.5,
     p2p_blend_ratio=0.8
 ):
     """
     Run prompt-to-prompt editing for 3D generation.
 
+    This uses pure Prompt2Prompt attention control (no ControlNet) to edit the 3D asset
+    while preserving structure through cross-attention manipulation.
+
     Args:
         k3d_wrapper: Kiss3D wrapper instance
         input_image_path: Path to input image
         source_prompt: Original prompt describing the input
         target_prompt: Target prompt for editing
-        use_controlnet: Whether to use ControlNet for structure preservation
         p2p_replace_steps: Timestep threshold for switching prompts (0-1)
         p2p_blend_ratio: Attention blending ratio (0-1)
 
     Returns:
         gen_save_path: Path to generated 3D bundle image
         recon_mesh_path: Path to reconstructed 3D mesh
+
+    Note:
+        For ControlNet-based editing, use generate_3d_bundle_image_controlnet() instead.
     """
     # Renew UUID for this generation
     k3d_wrapper.renew_uuid()
@@ -56,60 +60,28 @@ def run_prompt2prompt_edit(
         use_mv_rgb=True
     )
 
-    # Step 2: Apply prompt-to-prompt editing
+    # Step 2: Apply prompt-to-prompt editing (pure P2P, no ControlNet)
     logger.info(f"Applying prompt-to-prompt editing...")
     logger.info(f"  Source prompt: {source_prompt}")
     logger.info(f"  Target prompt: {target_prompt}")
     logger.info(f"  Replace threshold: {p2p_replace_steps}")
     logger.info(f"  Blend ratio: {p2p_blend_ratio}")
 
-    if use_controlnet:
-        # Prepare ControlNet conditions for structure preservation
-        control_mode = ['tile']
-        control_image = [
-            k3d_wrapper.preprocess_controlnet_cond_image(
-                reference_3d_bundle_image,
-                mode_,
-                down_scale=1,
-                kernel_size=51,
-                sigma=2.0
-            ) for mode_ in control_mode
-        ]
-        control_guidance_start = [0.0]
-        control_guidance_end = [0.65]
-        controlnet_conditioning_scale = [0.6]
-
-        # Generate with prompt-to-prompt + ControlNet
-        gen_3d_bundle_image, gen_save_path = k3d_wrapper.generate_3d_bundle_image_prompt2prompt(
-            source_prompt=source_prompt,
-            target_prompt=target_prompt,
-            image=reference_3d_bundle_image.unsqueeze(0),
-            strength=0.95,
-            control_image=control_image,
-            control_mode=control_mode,
-            control_guidance_start=control_guidance_start,
-            control_guidance_end=control_guidance_end,
-            controlnet_conditioning_scale=controlnet_conditioning_scale,
-            p2p_replace_steps=p2p_replace_steps,
-            p2p_blend_ratio=p2p_blend_ratio,
-            lora_scale=1.0,
-        )
-    else:
-        # Generate with prompt-to-prompt only
-        gen_3d_bundle_image, gen_save_path = k3d_wrapper.generate_3d_bundle_image_prompt2prompt(
-            source_prompt=source_prompt,
-            target_prompt=target_prompt,
-            image=reference_3d_bundle_image.unsqueeze(0),
-            strength=0.95,
-            p2p_replace_steps=p2p_replace_steps,
-            p2p_blend_ratio=p2p_blend_ratio,
-            lora_scale=1.0,
-        )
+    # Generate with prompt-to-prompt only
+    gen_3d_bundle_image, gen_save_path = k3d_wrapper.generate_3d_bundle_image_prompt2prompt(
+        source_prompt=source_prompt,
+        target_prompt=target_prompt,
+        image=reference_3d_bundle_image.unsqueeze(0),
+        strength=0.95,
+        p2p_replace_steps=p2p_replace_steps,
+        p2p_blend_ratio=p2p_blend_ratio,
+        lora_scale=1.0,
+    )
 
     # Step 3: 3D reconstruction
     logger.info("Reconstructing 3D mesh from edited bundle...")
     vertices, faces, lrm_multi_view_normals, lrm_multi_view_rgb, lrm_multi_view_albedo = \
-        k3d_wrapper.reconstruct_from_3D_bundle_image(gen_3d_bundle_image)
+        k3d_wrapper.reconstruct_3d_bundle_image(gen_3d_bundle_image)
 
     # Step 4: Mesh optimization (optional)
     logger.info("Optimizing mesh with Isomer...")
@@ -148,7 +120,6 @@ if __name__ == "__main__":
         input_image_path='./examples/car.png',  # Replace with your image
         source_prompt="a red sports car",
         target_prompt="a blue sports car",
-        use_controlnet=True,
         p2p_replace_steps=0.5,  # Switch prompts at 50% of denoising
         p2p_blend_ratio=0.8     # Use 80% of stored attention
     )
@@ -171,7 +142,6 @@ if __name__ == "__main__":
         input_image_path='./examples/chair.png',  # Replace with your image
         source_prompt="a modern minimalist chair",
         target_prompt="a vintage wooden chair",
-        use_controlnet=True,
         p2p_replace_steps=0.6,  # Later switch for more structural change
         p2p_blend_ratio=0.7     # Lower ratio for more freedom
     )
@@ -194,7 +164,6 @@ if __name__ == "__main__":
         input_image_path='./examples/toy.png',  # Replace with your image
         source_prompt="a plastic toy robot",
         target_prompt="a metal toy robot",
-        use_controlnet=True,
         p2p_replace_steps=0.5,
         p2p_blend_ratio=0.85    # Higher ratio to preserve shape
     )
@@ -223,6 +192,5 @@ if __name__ == "__main__":
     print("    - 0.8-0.9: Better structure preservation (recommended)")
     print("    - 0.9-1.0: Maximum structure preservation")
     print()
-    print("  • use_controlnet: Enable for better spatial consistency")
-    print("    - True: Recommended for most cases")
-    print("    - False: More freedom but less structure preservation")
+    print("Note: This example uses pure Prompt2Prompt (no ControlNet).")
+    print("      For ControlNet-based editing, use generate_3d_bundle_image_controlnet().")
