@@ -538,6 +538,53 @@ class kiss3d_wrapper(object):
             return gen_3d_bundle_image_, save_path
 
         return gen_3d_bundle_image_
+
+    def run_flux_img2img(self,
+                         prompt,
+                         image,
+                         strength=0.6,
+                         num_inference_steps=None,
+                         seed=None,
+                         guidance_scale=3.5,
+                         lora_scale=1.0):
+        """
+        Standard SDE-Edit / Img2Img using Flux without ControlNet.
+        Allows general purpose image editing using Flux.
+        """
+        if isinstance(self.flux_pipeline, FluxImg2ImgPipeline):
+            flux_pipeline = self.flux_pipeline
+        else:
+            flux_pipeline = convert_flux_pipeline(self.flux_pipeline, FluxImg2ImgPipeline)
+
+        flux_device = self.config['flux'].get('device', 'cpu')
+        seed = seed or self.config['flux'].get('seed', 0)
+        num_inference_steps = num_inference_steps or self.config['flux'].get('num_inference_steps', 20)
+
+        generator = torch.Generator(device=flux_device).manual_seed(seed)
+        
+        # Ensure image is PIL or compatible for simple usage
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        elif isinstance(image, np.ndarray):
+            image = Image.fromarray(image).convert("RGB")
+        # If image is Tensor, pipeline handles it, but usually app passes PIL
+
+        hparam_dict = {
+            'prompt': prompt,
+            'image': image, 
+            'strength': strength,
+            'num_inference_steps': num_inference_steps,
+            'guidance_scale': guidance_scale,
+            'num_images_per_prompt': 1,
+            'output_type': 'pil',
+            'generator': generator,
+            'joint_attention_kwargs': {"scale": lora_scale}
+        }
+
+        with self.context():
+            result_image = flux_pipeline(**hparam_dict).images[0]
+            
+        return result_image
     
     def reconstruct_3d_bundle_image(self, 
         image, 

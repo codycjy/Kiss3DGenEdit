@@ -159,6 +159,27 @@ def bundle_image_to_mesh(
     else:
         return recon_mesh_path, mesh_cache
 
+def flux_img2img_main(image, prompt, strength, seed, steps, guidance_scale):
+    print(f"Before flux_img2img_main: {torch.cuda.memory_allocated() / 1024**3} GB")
+    if image is None:
+        return None
+    
+    k3d_wrapper.renew_uuid()
+    
+    # Use the new generic img2img method
+    result_image = k3d_wrapper.run_flux_img2img(
+        prompt=prompt,
+        image=image,
+        strength=strength,
+        num_inference_steps=int(steps),
+        seed=int(seed) if seed is not None else None,
+        guidance_scale=guidance_scale
+    )
+    
+    print(f"After flux_img2img_main: {torch.cuda.memory_allocated() / 1024**3} GB")
+    return result_image
+
+
 _HEADER_=f"""
 <img src="{LOGO_PATH}">
     <h2><b>Official 🤗 Gradio Demo</b></h2><h2>
@@ -328,6 +349,25 @@ def main():
                         output_image3 = gr.Image(label="Final Bundle Image", interactive=False)
                         output_video2 = gr.Video(label="Generated Video", interactive=False, loop=True, autoplay=True)
                         download_2 = gr.DownloadButton(label="Download mesh", interactive=False)
+            
+            with gr.TabItem('Image Editing', id='tab_img_edit'):
+                with gr.Row():
+                    with gr.Column():
+                        edit_input_image = gr.Image(label="Input Image", type="pil")
+                        edit_prompt = gr.Textbox(label="Editing Prompt", lines=2, placeholder="Describe the desired modification...")
+                        
+                        with gr.Row():
+                            edit_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.75, step=0.01, label="Strength (Denoising Strength)")
+                            edit_seed = gr.Number(value=42, label="Seed")
+                        
+                        with gr.Accordion("Advanced Settings", open=False):
+                            edit_steps = gr.Slider(minimum=1, maximum=50, value=20, step=1, label="Inference Steps")
+                            edit_guidance = gr.Slider(minimum=1.0, maximum=20.0, value=3.5, step=0.1, label="Guidance Scale")
+
+                        btn_edit_image = gr.Button("Edit Image")
+
+                    with gr.Column():
+                        edit_output_image = gr.Image(label="Edited Image", interactive=False)
 
         btn_img2mesh_preprocess.click(fn=image2mesh_preprocess_, inputs=[image, seed2], outputs=[output_image2, image_caption])
 
@@ -342,6 +382,13 @@ def main():
         btn_gen_mesh.click(fn=bundle_image_to_mesh, inputs=[output_image1,], outputs=[output_video1, download_1]).then(
             lambda: gr.Button(interactive=True),
             outputs=[download_1],
+        )
+
+        # Connect Image Editing button
+        btn_edit_image.click(
+            fn=flux_img2img_main,
+            inputs=[edit_input_image, edit_prompt, edit_strength, edit_seed, edit_steps, edit_guidance],
+            outputs=[edit_output_image]
         )
 
         with gr.Row():
