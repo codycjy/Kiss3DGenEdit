@@ -14,6 +14,7 @@ import time
 
 from pipeline.utils import logger, TMP_DIR, OUT_DIR
 from pipeline.utils import lrm_reconstruct, isomer_reconstruct, preprocess_input_image
+from pipeline.p2p_utils import AttentionControlEdit, FluxP2PAttnProcessor, AttentionStore, EmptyControl
 
 import torch
 import torchvision
@@ -48,6 +49,29 @@ def convert_flux_pipeline(exist_flux_pipe, target_pipe, **kwargs):
         **kwargs
     )
     return new_pipe
+
+def register_attention_control(model, controller):
+    def _register_attn(module):
+        if hasattr(module, "processor"):
+            # Identify if it is Double or Single block
+            # FluxTransformerBlock (Double) has explicit `attn`
+            # FluxSingleTransformerBlock (Single) has `attn`
+            # We can check the class name of parent? Hard in apply.
+            # But we can check `module` itself.
+            pass
+            
+    attn_procs = {}
+    
+    # Flux has "transformer.transformer_blocks" (Double) and "transformer.single_transformer_blocks" (Single)
+    
+    for i, block in enumerate(model.transformer.transformer_blocks):
+        attn_procs[f"transformer_blocks.{i}.attn.processor"] = FluxP2PAttnProcessor(controller, place_in_unet=f"double_block_{i}")
+        
+    for i, block in enumerate(model.transformer.single_transformer_blocks):
+        attn_procs[f"single_transformer_blocks.{i}.attn.processor"] = FluxP2PAttnProcessor(controller, place_in_unet=f"single_block_{i}")
+        
+    model.transformer.set_attn_processor(attn_procs)
+
 
 # @spaces.GPU
 def init_wrapper_from_config(config_path):
@@ -538,6 +562,96 @@ class kiss3d_wrapper(object):
             return gen_3d_bundle_image_, save_path
 
         return gen_3d_bundle_image_
+
+    def generate_3d_bundle_image_p2p(self, source_prompt, target_prompt,
+                                     image=None, strength=1.0,
+                                     cross_replace_steps=0.8, self_replace_steps=0.8,
+                                     lora_scale=1.0,
+                                     num_inference_steps=None,
+                                     seed=None,
+                                     save_intermediate_results=True,
+                                     **kwargs):
+        """
+        P2P generation function
+        """
+        if isinstance(self.flux_pipeline, FluxImg2ImgPipeline):
+            flux_pipeline = self.flux_pipeline
+        else:
+            flux_pipeline = convert_flux_pipeline(self.flux_pipeline, FluxImg2ImgPipeline)
+
+        flux_device = self.config['flux'].get('device', 'cpu')
+        seed = seed or self.config['flux'].get('seed', 0)
+        num_inference_steps = num_inference_steps or self.config['flux'].get('num_inference_steps', 20)
+
+        if image is None:
+            image = torch.zeros((1, 3, 1024, 2048), dtype=torch.float32, device=flux_device)
+
+        generator = torch.Generator(device=flux_device).manual_seed(seed)
+
+        prompts = [source_prompt, target_prompt]
+        
+        controller = AttentionControlEdit(
+            prompts, 
+            num_steps=num_inference_steps,
+            cross_replace_steps=cross_replace_steps,
+            self_replace_steps=self_replace_steps
+        )
+        
+        register_attention_control(flux_pipeline, controller)
+
+        # Run P2P (Source and Target in batch)
+        # Flux Pipeline handles prompts as list for batching
+        
+        # Common prompt prefix
+        prefix = 'A grid of 2x4 multi-view image, elevation 5. White background.'
+        full_prompts = [' '.join([prefix, p]) for p in prompts]
+        full_prompts_1 = [prefix for _ in prompts] # prompt 1 is usually fixed structure
+        
+        # Duplicate image for batch
+        if isinstance(image, Image.Image):
+             # If it's a PIL image, we don't need to repeat it here, the pipeline handles it?
+             # Actually Flux pipeline expects tensor or PIL.
+             # If we pass a list of prompts, we should pass a list of images or a batch tensor.
+             image_batch = [image, image]
+        elif isinstance(image, torch.Tensor):
+             image_batch = image.repeat(2, 1, 1, 1) if image.shape[0] == 1 else image
+        else:
+             # Fallback for other types (like PngImageFile which is a PIL Image subclass)
+             image_batch = [image, image]
+
+        hparam_dict = {
+            'prompt': full_prompts_1,
+            'prompt_2': full_prompts,
+            'image': image_batch,
+            'strength': strength,
+            'num_inference_steps': num_inference_steps,
+            'guidance_scale': 3.5,
+            'num_images_per_prompt': 1,
+            'width': 2048,
+            'height': 1024,
+            'output_type': 'np',
+            'generator': [generator, generator], # Same generator for consistent noise
+            'joint_attention_kwargs': {"scale": lora_scale},
+            'callback_on_step_end': lambda pipe, i, t, k: controller.step_callback(None)
+        }
+        hparam_dict.update(kwargs)
+
+        with self.context():
+            gen_images = flux_pipeline(**hparam_dict).images
+            
+        # gen_images shape (2, 1024, 2048, 3)
+        # We return the target image (index 1)
+        
+        target_image = gen_images[1]
+        gen_3d_bundle_image_ = torch.from_numpy(target_image).permute(2, 0, 1).contiguous().float() # (3, 1024, 2048)
+
+        if save_intermediate_results:
+            save_path = os.path.join(TMP_DIR, f'{self.uuid}_gen_3d_bundle_image_p2p.png')
+            torchvision.utils.save_image(gen_3d_bundle_image_, save_path)
+            logger.info(f"Save generated 3D bundle image to {save_path}")
+            return gen_3d_bundle_image_, save_path
+            
+        return gen_3d_bundle_image_
     
     def reconstruct_3d_bundle_image(self, 
         image, 
@@ -612,6 +726,35 @@ def run_text_to_3d(k3d_wrapper,
     recon_mesh_path = k3d_wrapper.reconstruct_3d_bundle_image(gen_3d_bundle_image, save_intermediate_results=False,
                                                               isomer_radius=4.2, reconstruction_stage2_steps=50)
 
+    return gen_save_path, recon_mesh_path
+
+def run_p2p_edit(k3d_wrapper, source_prompt, target_prompt, init_image_path=None, cross_replace_steps=0.8, self_replace_steps=0.8):
+    """
+    New function to run P2P editing pipeline
+    """
+    k3d_wrapper.renew_uuid()
+    
+    init_image = None
+    if init_image_path is not None:
+        init_image = Image.open(init_image_path)
+        
+    logger.info(f"P2P Edit: {source_prompt} -> {target_prompt}")
+    
+    gen_3d_bundle_image, gen_save_path = k3d_wrapper.generate_3d_bundle_image_p2p(
+        source_prompt, target_prompt,
+        image=init_image,
+        strength=1.0,
+        cross_replace_steps=cross_replace_steps,
+        self_replace_steps=self_replace_steps
+    )
+    
+    recon_mesh_path = k3d_wrapper.reconstruct_3d_bundle_image(
+        gen_3d_bundle_image, 
+        save_intermediate_results=False,
+        isomer_radius=4.2, 
+        reconstruction_stage2_steps=50
+    )
+    
     return gen_save_path, recon_mesh_path
 
 def image2mesh_preprocess(k3d_wrapper, input_image_, seed, use_mv_rgb=True):
