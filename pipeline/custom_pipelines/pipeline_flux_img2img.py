@@ -1,4 +1,3 @@
-
 # copied from diffusers/src/diffusers/pipeline/flux/pipeline_flux_img2img.py
 
 # Copyright 2024 Black Forest Labs and The HuggingFace Team. All rights reserved.
@@ -159,8 +158,10 @@ def retrieve_timesteps(
             timesteps = scheduler.timesteps
             num_inference_steps = len(timesteps)
         else:
-            scheduler.set_timesteps(num_inference_steps, device=device)#, **kwargs)
+            # Pass mu parameter for Flux timestep shifting (critical for strength to work!)
+            scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
             timesteps = scheduler.timesteps
+            num_inference_steps = len(timesteps)
 
     return timesteps, num_inference_steps
 
@@ -757,6 +758,21 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             self.scheduler.config.max_shift,
         )
         # sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        
+        # 修复逻辑：使用 get_timesteps 获取 timesteps 后，不再重复调用 retrieve_timesteps
+        # 或者确保 retrieve_timesteps 和 get_timesteps 的配合正确
+        # 原始有问题的代码：
+        # timesteps, num_inference_steps = retrieve_timesteps(
+        #     self.scheduler,
+        #     num_inference_steps,
+        #     device,
+        #     sigmas=sigmas,
+        #     mu=mu,
+        # )
+        # timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+        
+        # 修正后的逻辑：先获取全量 timesteps，再根据 strength 截断
+        # 1. 获取包含 mu shift 的全量 timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -764,7 +780,21 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             sigmas=sigmas,
             mu=mu,
         )
-        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+        
+        # 2. 手动根据 strength 计算需要保留的步数
+        # 这里的逻辑是：strength 越大，加噪越多，去噪步数越多 (从 t=1000 开始的一大段)
+        # strength=1.0 -> 全部步数
+        # strength=0.1 -> 最后的一小部分步数
+        
+        # get_timesteps 的默认实现可能会有问题，我们手动实现
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        
+        # 截取 timesteps
+        timesteps = timesteps[t_start * self.scheduler.order :]
+        
+        # 更新 num_inference_steps 为实际运行的步数
+        num_inference_steps = len(timesteps) // self.scheduler.order
 
         if num_inference_steps < 1:
             raise ValueError(
@@ -789,7 +819,11 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             latents,
         )
 
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        # 修正 warmup steps 计算
+        # 原有: num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        # 因为我们已经截断了 timesteps，所以现在 timesteps 的长度就是我们要跑的总步数
+        # 对于标准的 scheduler，通常不需要 warmup steps，或者是在循环内部判断
+        num_warmup_steps = 0 
         self._num_timesteps = len(timesteps)
 
         # handle guidance

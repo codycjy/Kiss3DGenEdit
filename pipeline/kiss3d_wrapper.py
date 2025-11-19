@@ -80,7 +80,10 @@ def init_wrapper_from_config(config_path):
         flux_controlnet = FluxControlNetModel.from_pretrained(flux_controlnet_pth, torch_dtype=torch.bfloat16)
         flux_pipe = convert_flux_pipeline(flux_pipe, FluxControlNetImg2ImgPipeline, controlnet=[flux_controlnet])
 
-    flux_pipe.scheduler = FlowMatchHeunDiscreteScheduler.from_config(flux_pipe.scheduler.config)
+    # FlowMatchHeunDiscreteScheduler doesn't support mu/sigmas, which breaks img2img strength
+    # Use FlowMatchEulerDiscreteScheduler instead (supports mu for timestep shifting)
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+    flux_pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(flux_pipe.scheduler.config)
         
 
     # breakpoint()
@@ -546,7 +549,7 @@ class kiss3d_wrapper(object):
                          num_inference_steps=None,
                          seed=None,
                          guidance_scale=3.5,
-                         lora_scale=1.0):
+                         lora_scale=0.0):
         """
         Standard SDE-Edit / Img2Img using Flux without ControlNet.
         Allows general purpose image editing using Flux.
