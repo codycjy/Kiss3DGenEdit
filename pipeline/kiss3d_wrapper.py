@@ -217,6 +217,7 @@ def init_minimum_wrapper_from_config(config_path):
     # 加载 LoRA
     if flux_lora_pth is not None:
         if not os.path.exists(flux_lora_pth):
+
             flux_lora_pth = hf_hub_download(
                 repo_id="LTT/Kiss3DGen",
                 filename="rgb_normal.safetensors",
@@ -688,11 +689,11 @@ class kiss3d_wrapper(object):
         self,
         prompt_src: str,
         prompt_tgt: str,
+        image: Optional[torch.Tensor] = None,
         lora_scale: float = 1.0,
         num_inference_steps: Optional[int] = None,
         seed: Optional[int] = None,
         redux_hparam: Optional[dict] = None,
-        save_intermediate_results: bool = True,
         p2p_tau: float = 0.5,
         **kwargs,
     ):
@@ -713,6 +714,9 @@ class kiss3d_wrapper(object):
         seed = seed or self.config["flux"].get("seed", 0)
         num_inference_steps = num_inference_steps or self.config["flux"].get("num_inference_steps", 20)
 
+        if image is None:
+            image = torch.zeros((1, 3, 1024, 2048), dtype=torch.float32, device=flux_device)
+
         generator = torch.Generator(device=flux_device).manual_seed(seed)
 
         # 2) 和原函数一致的 multi-view base prompt
@@ -728,8 +732,10 @@ class kiss3d_wrapper(object):
             "prompt_tgt": base_prompt,      # 给 CLIP 的 target 文本
             "prompt_2_src": prompt_2_src,   # 给 T5 的 source 文本（长 prompt）
             "prompt_2_tgt": prompt_2_tgt,   # 给 T5 的 target 文本（长 prompt）
+            "image": image,
             "height": 1024,
             "width": 2048,
+            'strength': 1.0,
             "num_inference_steps": num_inference_steps,
             "sigmas": None,
             "guidance_scale": 3.5,
@@ -779,16 +785,6 @@ class kiss3d_wrapper(object):
             .float()
         )
 
-        # 7) 按需保存两张 bundle 图
-        if save_intermediate_results:
-            save_path_src = os.path.join(TMP_DIR, f"{self.uuid}_src_3d_bundle_image.png")
-            save_path_tgt = os.path.join(TMP_DIR, f"{self.uuid}_tgt_3d_bundle_image.png")
-            torchvision.utils.save_image(bundle_src, save_path_src)
-            torchvision.utils.save_image(bundle_tgt, save_path_tgt)
-            logger.info(f"Save source 3D bundle image to {save_path_src}")
-            logger.info(f"Save target 3D bundle image to {save_path_tgt}")
-            return bundle_src, bundle_tgt, save_path_src, save_path_tgt
-
         return bundle_src, bundle_tgt
 
 def run_text_to_3d(k3d_wrapper,
@@ -820,6 +816,8 @@ def run_text_to_3d(k3d_wrapper,
 
     return gen_save_path, recon_mesh_path
 
+
+
 def run_edit_3d_bundle(k3d_wrapper,
                        prompt_src,
                        prompt_tgt, 
@@ -841,26 +839,25 @@ def run_edit_3d_bundle(k3d_wrapper,
     logger.info(f'Source prompt: "{prompt_src}"')
     logger.info(f'Target prompt: "{prompt_tgt}"')
 
-    prompt_src_refined = k3d_wrapper.get_detailed_prompt(prompt_src)
-    prompt_tgt_refined = k3d_wrapper.get_detailed_prompt(prompt_tgt)
+    # prompt_src_refined = k3d_wrapper.get_detailed_prompt(prompt_src)
+    # prompt_tgt_refined = k3d_wrapper.get_detailed_prompt(prompt_tgt)
+
+    prompt_src_refined = prompt_src
+    prompt_tgt_refined = prompt_tgt
 
     start = time.time()
-    image_src, image_tgt = k3d_wrapper.generate_3d_bundle_image_text_edit(
+    bundle_src, bundle_tgt = k3d_wrapper.generate_3d_bundle_image_text_edit(
         prompt_src=prompt_src_refined,
         prompt_tgt=prompt_tgt_refined,
         p2p_tau=p2p_tau,
-        save_intermediate_results=True
     )
     print(f"3d bundle image edit time: {time.time() - start}")
 
-    # image_src, image_tgt: 预期为 np.ndarray, 形状 (1, H, W, 3)
-    bundle_src = torch.from_numpy(image_src).squeeze(0).permute(2, 0, 1).contiguous().float()  # (3, 1024, 2048)
-    bundle_tgt = torch.from_numpy(image_tgt).squeeze(0).permute(2, 0, 1).contiguous().float()  # (3, 1024, 2048)
-
-    # 保存中间结果
-    save_path_src = os.path.join(TMP_DIR, f"{k3d_wrapper.uuid}_edit_src_3d_bundle_image.png")
-    save_path_tgt = os.path.join(TMP_DIR, f"{k3d_wrapper.uuid}_edit_tgt_3d_bundle_image.png")
-
+    save_path_src = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_3d_bundle_image_src.png')
+    save_path_tgt = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_3d_bundle_image_tgt.png')
+    os.makedirs(os.path.dirname(save_path_src), exist_ok=True)
+    os.makedirs(os.path.dirname(save_path_tgt), exist_ok=True)
+    
     torchvision.utils.save_image(bundle_src, save_path_src)
     torchvision.utils.save_image(bundle_tgt, save_path_tgt)
 

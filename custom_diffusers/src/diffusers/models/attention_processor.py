@@ -2088,8 +2088,12 @@ class FluxAttnProcessor2_0:
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         # ===== 新增：来自 joint_attention_kwargs 的参数 =====
-        p2p_state: Optional[Dict[str, Any]] = None,
         p2p_mode: Optional[str] = None,           # "record" / "edit" / None
+        p2p_step: Optional[int] = None,
+        p2p_tau_index: Optional[int] = None,
+        p2p_enable: Optional[bool] = None,
+        p2p_state: Optional[Dict[str, Any]] = None,
+
         block_index: Optional[int] = None,        # 第几层
         block_type: Optional[str] = None,         # "mmdit" / "single" 等
     ) -> torch.FloatTensor:
@@ -2115,13 +2119,11 @@ class FluxAttnProcessor2_0:
 
         # ======= P2P 钩子：只对 image q/k 做缓存 / 替换 =======
         use_p2p_img = (
-            p2p_state is not None
-            and isinstance(p2p_state, dict)
-            and p2p_mode is not None
-            and block_index is not None
+            p2p_enable and p2p_mode in ["record", "edit"]
         )
 
         if use_p2p_img:
+
             layer_key = f"{block_type or 'block'}_{block_index}"
 
             # 初始化缓存 dict

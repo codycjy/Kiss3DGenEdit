@@ -1,18 +1,38 @@
-from pipeline.kiss3d_wrapper import init_wrapper_from_config, run_edit_3d_bundle
+from pipeline.kiss3d_wrapper import init_wrapper_from_config, run_edit_3d_bundle, init_minimum_wrapper_from_config
 import os
 from pipeline.utils import logger, TMP_DIR, OUT_DIR
 import time
 if __name__ == "__main__":
     os.makedirs(os.path.join(OUT_DIR, 'text_to_3d'), exist_ok=True)
-    k3d_wrapper = init_wrapper_from_config('./pipeline/pipeline_config/default.yaml')
-    src_prompt = 'A doll of a girl in Harry Potter'
-    tgt_prompt = 'A doll of a girl in Harry Potter with glasses'
-    name = src_prompt.replace(' ', '_') + '_to_' + tgt_prompt.replace(' ', '_')
+    k3d_wrapper = init_minimum_wrapper_from_config('./pipeline/pipeline_config/default.yaml')
+    src_prompt = 'A charming 3D doll of a young girl styled as a Hogwarts student, ' \
+                'with a whimsical, magical flair. Front view features a radiant smile, ' \
+                'large, twinkling eyes, and a Gryffindor scarf with a cozy, fluffy texture; ' \
+                'left side view showcases a miniature wand tucked behind her ear, ' \
+                'with a tiny golden snitch hanging from a string; ' \
+                'rear view presents a backpack adorned with house badges and a small owl figurine; ' \
+                'right side view displays a playful broomstick with feathers fluttering gently, ' \
+                'alongside a tiny house elf mascot. No background. ' \
+                'Arranged in a 2x4 grid with RGB images on top and normal maps below.'
+    tgt_prompt = 'A charming 3D doll of a young girl styled as a Hogwarts student, ' \
+                'with a whimsical, magical flair. Front view features a sad expression, ' \
+                'large, twinkling eyes, and a Gryffindor scarf with a cozy, fluffy texture; ' \
+                'left side view showcases a miniature wand tucked behind her ear, ' \
+                'with a tiny golden snitch hanging from a string; ' \
+                'rear view presents a backpack adorned with house badges and a small owl figurine; ' \
+                'right side view displays a playful broomstick with feathers fluttering gently, ' \
+                'alongside a tiny house elf mascot. No background.' \
+                'Arranged in a 2x4 grid with RGB images on top and normal maps below.'
+    name = "doll_girl"
     os.system(f'rm -rf {TMP_DIR}/*')
     end = time.time()
-    src_img, tgt_img, _, _ = run_edit_3d_bundle(k3d_wrapper, prompt_src=src_prompt, prompt_tgt=tgt_prompt)
+    p2p_tau = 0.2
+    src_img, tgt_img, src_save_path, tgt_save_path = run_edit_3d_bundle(k3d_wrapper, 
+                                                prompt_src=src_prompt, 
+                                                prompt_tgt=tgt_prompt,
+                                                p2p_tau=p2p_tau)
     print(f" edit_3d_bundle time: {time.time() - end}")
-    os.system(f'cp -f {src_img} {OUT_DIR}/text_to_3d/{name}_src_3d_bundle.png')
-    os.system(f'cp -f {tgt_img} {OUT_DIR}/text_to_3d/{name}_tgt_3d_bundle.png')
+    os.system(f'cp -f {src_img} {OUT_DIR}/text_to_3d/{name}_tau{p2p_tau}_src_3d_bundle_{int(time.time())}.png')
+    os.system(f'cp -f {tgt_img} {OUT_DIR}/text_to_3d/{name}_tau{p2p_tau}_tgt_3d_bundle_{int(time.time())}.png')
     
 
