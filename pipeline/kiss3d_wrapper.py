@@ -708,6 +708,11 @@ class kiss3d_wrapper(object):
         t2i_mask_sigma: float = 2.0,
         return_mask: bool = True,
         per_view_mask: bool = False,
+        # ===== CLIPSeg Spatial Mask 相关参数 =====
+        clipseg_mask_prompt: Optional[str] = None,
+        external_mask: Optional[torch.Tensor] = None,
+        mask_threshold: float = 0.5,
+        mask_invert: bool = False,
         **kwargs,
     ):
         """
@@ -720,6 +725,12 @@ class kiss3d_wrapper(object):
             t2i_mask_sigma: 高斯平滑参数
             return_mask: 是否返回生成的 mask
             per_view_mask: 是否为每个视角独立计算 mask
+            clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+            external_mask: 直接传入的 mask tensor [1, 1, H, W]
+            mask_threshold: CLIPSeg 二值化阈值
+            mask_invert: 是否反转 mask
+                - False: prompt 区域 mask=1（保持该区域不变）
+                - True: prompt 区域 mask=0（编辑该区域）
 
         返回:
             如果 return_mask=True: (bundle_src, bundle_tgt, mask)
@@ -773,6 +784,11 @@ class kiss3d_wrapper(object):
             "t2i_mask_sigma": t2i_mask_sigma,
             "return_mask": return_mask,
             "per_view_mask": per_view_mask,
+            # CLIPSeg Spatial Mask 参数
+            "clipseg_mask_prompt": clipseg_mask_prompt,
+            "external_mask": external_mask,
+            "mask_threshold": mask_threshold,
+            "mask_invert": mask_invert,
         }
         hparam_dict.update(kwargs)
 
@@ -863,7 +879,12 @@ def run_edit_3d_bundle(k3d_wrapper,
                        t2i_mask_threshold=0.5,
                        t2i_mask_sigma=2.0,
                        return_mask=True,
-                       per_view_mask=False):
+                       per_view_mask=False,
+                       # CLIPSeg Spatial Mask 参数
+                       clipseg_mask_prompt=None,
+                       external_mask=None,
+                       mask_threshold=0.5,
+                       mask_invert=False):
     """
     使用 Flux 的 edit 接口，从源提示词 prompt_src 到目标提示词 prompt_tgt，
     生成一对 3D bundle images（源 / 目标），不进行 3D 重建。
@@ -875,6 +896,12 @@ def run_edit_3d_bundle(k3d_wrapper,
         t2i_mask_sigma: 高斯平滑参数
         return_mask: 是否返回生成的 mask
         per_view_mask: 是否为每个视角独立计算 mask
+        clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+        external_mask: 直接传入的 mask tensor [1, 1, H, W]
+        mask_threshold: CLIPSeg 二值化阈值
+        mask_invert: 是否反转 mask
+            - False: prompt 区域 mask=1（保持该区域不变）
+            - True: prompt 区域 mask=0（编辑该区域）
 
     返回:
         bundle_src: torch.Tensor, 形状 (3, 1024, 2048), [0., 1.]
@@ -907,6 +934,11 @@ def run_edit_3d_bundle(k3d_wrapper,
         t2i_mask_sigma=t2i_mask_sigma,
         return_mask=return_mask,
         per_view_mask=per_view_mask,
+        # CLIPSeg Spatial Mask 参数
+        clipseg_mask_prompt=clipseg_mask_prompt,
+        external_mask=external_mask,
+        mask_threshold=mask_threshold,
+        mask_invert=mask_invert,
     )
     print(f"3d bundle image edit time: {time.time() - start}")
 

@@ -2080,6 +2080,55 @@ class FluxAttnProcessor2_0:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
+    def _reshape_mask_to_tokens(
+        self,
+        mask: torch.Tensor,  # [batch, 1, h, w]
+        target_shape: tuple,  # [batch, heads, seq_len, head_dim]
+    ) -> torch.Tensor:
+        """
+        将 spatial mask 转换为 token 维度
+
+        Flux 使用 2x2 packing，latent [h, w] → tokens [h//2 * w//2]
+
+        Args:
+            mask: [batch, 1, h, w] spatial mask
+            target_shape: (batch, heads, seq_len, head_dim)
+
+        Returns:
+            token_mask: [batch, 1, seq_len, 1] 用于广播的 mask
+        """
+        batch, heads, seq_len, head_dim = target_shape
+
+        # 获取 mask 尺寸
+        h, w = mask.shape[-2:]
+
+        # 下采样到 packed 尺寸 (Flux 使用 2x2 packing)
+        packed_h, packed_w = h // 2, w // 2
+        mask = F.interpolate(
+            mask,
+            size=(packed_h, packed_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Flatten to [batch, num_tokens]
+        mask = mask.view(batch, -1)
+        num_tokens = mask.shape[-1]
+
+        # 如果 token 数不匹配，调整尺寸
+        if num_tokens != seq_len:
+            mask = F.interpolate(
+                mask.unsqueeze(1),
+                size=seq_len,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)
+
+        # 扩展到 [batch, 1, seq_len, 1] 以便广播到所有 heads 和 head_dim
+        mask = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq_len, 1]
+
+        return mask
+
     def __call__(
         self,
         attn: Attention,
@@ -2142,8 +2191,29 @@ class FluxAttnProcessor2_0:
 
                 if cached_q is not None and cached_k is not None:
                     if cached_q.shape == query.shape and cached_k.shape == key.shape:
-                        query = cached_q.to(device=query.device, dtype=query.dtype)
-                        key = cached_k.to(device=key.device, dtype=key.dtype)
+                        # ======= Spatial Mask 支持 =======
+                        # 获取外部传入的 spatial mask（如 CLIPSeg 生成的）
+                        spatial_edit_mask = p2p_state.get("spatial_edit_mask", None)
+
+                        cached_q = cached_q.to(device=query.device, dtype=query.dtype)
+                        cached_k = cached_k.to(device=key.device, dtype=key.dtype)
+
+                        if spatial_edit_mask is not None:
+                            # Mask-aware blending:
+                            # mask=1 区域使用 cached (保持原样)
+                            # mask=0 区域使用 current (允许编辑)
+                            token_mask = self._reshape_mask_to_tokens(
+                                spatial_edit_mask,
+                                query.shape,  # [batch, heads, seq_len, head_dim]
+                            )
+                            token_mask = token_mask.to(device=query.device, dtype=query.dtype)
+
+                            query = token_mask * cached_q + (1 - token_mask) * query
+                            key = token_mask * cached_k + (1 - token_mask) * key
+                        else:
+                            # 完全替换（原有逻辑）
+                            query = cached_q
+                            key = cached_k
                     else:
                         print(f"Warning: cached_q/key shape does not match current query/key shape in layer {layer_key}. Skipping P2P replacement.")
                     # 形状对不上就静默跳过

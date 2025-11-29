@@ -892,6 +892,11 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         t2i_mask_sigma: float = 2.0,
         return_mask: bool = True,
         per_view_mask: bool = False,
+        # ===== CLIPSeg Spatial Mask 相关参数 =====
+        clipseg_mask_prompt: Optional[str] = None,  # CLIPSeg 分割 prompt
+        external_mask: Optional[torch.Tensor] = None,  # 直接传入的 mask
+        mask_threshold: float = 0.5,  # CLIPSeg 二值化阈值
+        mask_invert: bool = False,  # True: prompt 区域可编辑; False: prompt 区域保持
     ):
         """
         Flux + ControlNet + P2P-style Edit.
@@ -909,6 +914,12 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             t2i_mask_sigma: 高斯平滑参数
             return_mask: 是否返回生成的 mask
             per_view_mask: 是否为每个视角独立计算 mask（用于 3D Bundle）
+            clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+            external_mask: 直接传入的 mask tensor [1, 1, H, W]
+            mask_threshold: CLIPSeg 二值化阈值
+            mask_invert: 是否反转 mask
+                - False: prompt 区域 mask=1（保持该区域不变）
+                - True: prompt 区域 mask=0（编辑该区域）
 
         返回：
             如果 return_mask=True: (image_src, image_tgt, mask)
@@ -1053,6 +1064,55 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         p2p_state = {}
         # 只在第一个 timestep 收集 T2I 注意力（噪声最大时，注意力最有信息量）
         collect_t2i_at_step = 0
+
+        # ======= CLIPSeg Spatial Mask 生成 =======
+        spatial_edit_mask = None
+
+        if clipseg_mask_prompt is not None:
+            from pipeline.utils_clipseg import CLIPSegMaskGenerator
+
+            print(f"Generating CLIPSeg mask for prompt: '{clipseg_mask_prompt}'")
+            clipseg = CLIPSegMaskGenerator(device=self._execution_device)
+
+            # 从 source image 生成 mask
+            spatial_edit_mask = clipseg.generate_mask(
+                image=image,
+                prompt=clipseg_mask_prompt,
+                threshold=mask_threshold,
+                invert=mask_invert,
+            )
+
+            # 调整到 latent 尺寸
+            latent_h = height // self.vae_scale_factor
+            latent_w = width // self.vae_scale_factor
+            spatial_edit_mask = clipseg.resize_mask_to_latent(
+                spatial_edit_mask,
+                latent_h=latent_h,
+                latent_w=latent_w,
+            )
+            spatial_edit_mask = spatial_edit_mask.to(device=self._execution_device)
+
+            print(f"CLIPSeg mask generated, shape: {spatial_edit_mask.shape}, "
+                  f"mask_invert={mask_invert}")
+
+        elif external_mask is not None:
+            # 使用外部传入的 mask
+            spatial_edit_mask = external_mask.to(device=self._execution_device)
+            # 确保 mask 尺寸正确
+            latent_h = height // self.vae_scale_factor
+            latent_w = width // self.vae_scale_factor
+            if spatial_edit_mask.shape[-2:] != (latent_h, latent_w):
+                spatial_edit_mask = torch.nn.functional.interpolate(
+                    spatial_edit_mask,
+                    size=(latent_h, latent_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            print(f"Using external mask, shape: {spatial_edit_mask.shape}")
+
+        # 将 spatial mask 存入 p2p_state
+        if spatial_edit_mask is not None:
+            p2p_state["spatial_edit_mask"] = spatial_edit_mask
 
         # ========= 6) 去噪循环：每步 ControlNet + 两个分支 =========
         with self.progress_bar(total=num_inference_steps) as progress_bar:
