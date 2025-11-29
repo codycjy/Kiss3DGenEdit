@@ -62,6 +62,7 @@ class CLIPSegMaskGenerator:
         invert: bool = False,
         soft_mask: bool = False,
         gaussian_sigma: float = 0.0,
+        combine_mode: str = "union",
     ) -> torch.Tensor:
         """
         生成语义分割 mask
@@ -69,13 +70,16 @@ class CLIPSegMaskGenerator:
         Args:
             image: 输入图像（PIL Image 或 [C, H, W] tensor）
             prompt: 分割文本（如 "face", "hair", "background"）
-                    可以是多个 prompt 的列表，会合并结果
+                    可以是多个 prompt 的列表
             threshold: 二值化阈值（仅 soft_mask=False 时生效）
             invert: 是否反转 mask
                     - False: prompt 区域 mask=1（保持该区域）
                     - True:  prompt 区域 mask=0（编辑该区域）
             soft_mask: 是否返回软 mask（连续值 [0,1]）
             gaussian_sigma: 高斯模糊标准差（0 表示不模糊）
+            combine_mode: 多个 prompt 的组合方式
+                    - "union": 并集，任意 prompt 匹配即为 1（OR）
+                    - "intersection": 交集，所有 prompt 都匹配才为 1（AND）
 
         Returns:
             mask: [1, 1, H, W] tensor，值域 [0, 1]
@@ -96,7 +100,7 @@ class CLIPSegMaskGenerator:
         if isinstance(prompt, str):
             prompts = [prompt]
         else:
-            prompts = prompt
+            prompts = list(prompt)
 
         # 处理输入
         inputs = self.processor(
@@ -110,18 +114,32 @@ class CLIPSegMaskGenerator:
         outputs = self.model(**inputs)
         logits = outputs.logits  # [num_prompts, H, W]
 
-        # 合并多个 prompt 的结果（取 max）
-        if len(prompts) > 1:
-            logits = logits.max(dim=0, keepdim=True)[0]  # [1, H, W]
-
         # Sigmoid 转概率
-        probs = torch.sigmoid(logits)  # [1, H, W]
+        probs = torch.sigmoid(logits)  # [num_prompts, H, W]
 
-        if soft_mask:
-            mask = probs
+        # 合并多个 prompt 的结果
+        if len(prompts) > 1:
+            if soft_mask:
+                # 软 mask 模式
+                if combine_mode == "union":
+                    probs = probs.max(dim=0, keepdim=True)[0]
+                else:  # intersection
+                    probs = probs.min(dim=0, keepdim=True)[0]
+            else:
+                # 硬 mask 模式：先二值化再组合
+                binary_masks = (probs > threshold).float()  # [num_prompts, H, W]
+                if combine_mode == "union":
+                    # OR: 任意一个为 1 则结果为 1
+                    combined = binary_masks.max(dim=0, keepdim=True)[0]
+                else:  # intersection
+                    # AND: 所有都为 1 才为 1
+                    combined = binary_masks.min(dim=0, keepdim=True)[0]
+                probs = combined
         else:
-            # 二值化
-            mask = (probs > threshold).float()
+            if not soft_mask:
+                probs = (probs > threshold).float()
+
+        mask = probs  # [1, H, W]
 
         # 反转
         if invert:
@@ -133,6 +151,9 @@ class CLIPSegMaskGenerator:
         # 高斯模糊
         if gaussian_sigma > 0:
             mask = self._gaussian_blur(mask, sigma=gaussian_sigma)
+            # 重新二值化（如果是硬 mask）
+            if not soft_mask:
+                mask = (mask > 0.5).float()
 
         return mask
 

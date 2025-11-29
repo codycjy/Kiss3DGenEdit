@@ -893,10 +893,11 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         return_mask: bool = True,
         per_view_mask: bool = False,
         # ===== CLIPSeg Spatial Mask 相关参数 =====
-        clipseg_mask_prompt: Optional[str] = None,  # CLIPSeg 分割 prompt
+        clipseg_mask_prompt: Optional[Union[str, List[str]]] = None,  # CLIPSeg 分割 prompt（可以是列表）
         external_mask: Optional[torch.Tensor] = None,  # 直接传入的 mask
         mask_threshold: float = 0.5,  # CLIPSeg 二值化阈值
         mask_invert: bool = False,  # True: prompt 区域可编辑; False: prompt 区域保持
+        mask_combine_mode: str = "union",  # 多 prompt 组合: "union"(OR) 或 "intersection"(AND)
     ):
         """
         Flux + ControlNet + P2P-style Edit.
@@ -914,12 +915,17 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
             t2i_mask_sigma: 高斯平滑参数
             return_mask: 是否返回生成的 mask
             per_view_mask: 是否为每个视角独立计算 mask（用于 3D Bundle）
-            clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+            clipseg_mask_prompt: CLIPSeg 分割 prompt，可以是：
+                - 单个字符串: "hair"
+                - 列表: ["hair", "clothes", "scarf"] 用于组合多个区域
             external_mask: 直接传入的 mask tensor [1, 1, H, W]
             mask_threshold: CLIPSeg 二值化阈值
             mask_invert: 是否反转 mask
                 - False: prompt 区域 mask=1（保持该区域不变）
                 - True: prompt 区域 mask=0（编辑该区域）
+            mask_combine_mode: 多个 prompt 的组合方式
+                - "union": 并集，任意 prompt 匹配即保持（OR）
+                - "intersection": 交集，所有 prompt 都匹配才保持（AND）
 
         返回：
             如果 return_mask=True: (image_src, image_tgt, mask)
@@ -1068,32 +1074,39 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         # ======= CLIPSeg Spatial Mask 生成 =======
         spatial_edit_mask = None
 
+        # 原始分辨率的 CLIPSeg mask（用于可视化）
+        clipseg_original_mask = None
+
         if clipseg_mask_prompt is not None:
             from pipeline.utils_clipseg import CLIPSegMaskGenerator
 
-            print(f"Generating CLIPSeg mask for prompt: '{clipseg_mask_prompt}'")
+            prompt_str = clipseg_mask_prompt if isinstance(clipseg_mask_prompt, str) else ", ".join(clipseg_mask_prompt)
+            print(f"Generating CLIPSeg mask for prompt: '{prompt_str}' (combine_mode={mask_combine_mode})")
             clipseg = CLIPSegMaskGenerator(device=self._execution_device)
 
-            # 从 source image 生成 mask
-            spatial_edit_mask = clipseg.generate_mask(
+            # 从 source image 生成 mask（原始分辨率）
+            clipseg_original_mask = clipseg.generate_mask(
                 image=image,
                 prompt=clipseg_mask_prompt,
                 threshold=mask_threshold,
                 invert=mask_invert,
+                combine_mode=mask_combine_mode,
             )
 
-            # 调整到 latent 尺寸
+            # 调整到 latent 尺寸（用于 attention 层）
             latent_h = height // self.vae_scale_factor
             latent_w = width // self.vae_scale_factor
             spatial_edit_mask = clipseg.resize_mask_to_latent(
-                spatial_edit_mask,
+                clipseg_original_mask,
                 latent_h=latent_h,
                 latent_w=latent_w,
             )
             spatial_edit_mask = spatial_edit_mask.to(device=self._execution_device)
 
-            print(f"CLIPSeg mask generated, shape: {spatial_edit_mask.shape}, "
-                  f"mask_invert={mask_invert}")
+            print(f"CLIPSeg mask generated:")
+            print(f"  - Original mask shape: {clipseg_original_mask.shape}")
+            print(f"  - Latent mask shape: {spatial_edit_mask.shape}")
+            print(f"  - mask_invert={mask_invert}")
 
         elif external_mask is not None:
             # 使用外部传入的 mask
@@ -1242,5 +1255,8 @@ class FluxImg2ImgPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFile
         self.maybe_free_model_hooks()
 
         if return_mask:
-            return image_src, image_tgt, t2i_mask
+            # 返回两种 mask:
+            # - t2i_mask: T2I attention 生成的 mask（如果 use_t2i_mask=True）
+            # - clipseg_original_mask: CLIPSeg 原始分辨率 mask（如果 clipseg_mask_prompt 有值）
+            return image_src, image_tgt, t2i_mask, clipseg_original_mask
         return image_src, image_tgt

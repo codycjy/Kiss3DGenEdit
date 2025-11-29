@@ -709,10 +709,11 @@ class kiss3d_wrapper(object):
         return_mask: bool = True,
         per_view_mask: bool = False,
         # ===== CLIPSeg Spatial Mask 相关参数 =====
-        clipseg_mask_prompt: Optional[str] = None,
+        clipseg_mask_prompt: Optional[Union[str, list]] = None,
         external_mask: Optional[torch.Tensor] = None,
         mask_threshold: float = 0.5,
         mask_invert: bool = False,
+        mask_combine_mode: str = "union",
         **kwargs,
     ):
         """
@@ -725,12 +726,17 @@ class kiss3d_wrapper(object):
             t2i_mask_sigma: 高斯平滑参数
             return_mask: 是否返回生成的 mask
             per_view_mask: 是否为每个视角独立计算 mask
-            clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+            clipseg_mask_prompt: CLIPSeg 分割 prompt，可以是：
+                - 单个字符串: "hair"
+                - 列表: ["hair", "clothes", "scarf"] 组合多个区域
             external_mask: 直接传入的 mask tensor [1, 1, H, W]
             mask_threshold: CLIPSeg 二值化阈值
             mask_invert: 是否反转 mask
                 - False: prompt 区域 mask=1（保持该区域不变）
                 - True: prompt 区域 mask=0（编辑该区域）
+            mask_combine_mode: 多个 prompt 的组合方式
+                - "union": 并集，任意 prompt 匹配即保持（OR）
+                - "intersection": 交集，所有 prompt 都匹配才保持（AND）
 
         返回:
             如果 return_mask=True: (bundle_src, bundle_tgt, mask)
@@ -789,6 +795,7 @@ class kiss3d_wrapper(object):
             "external_mask": external_mask,
             "mask_threshold": mask_threshold,
             "mask_invert": mask_invert,
+            "mask_combine_mode": mask_combine_mode,
         }
         hparam_dict.update(kwargs)
 
@@ -814,10 +821,11 @@ class kiss3d_wrapper(object):
 
         # 6) 解析返回值
         if return_mask:
-            image_src, image_tgt, t2i_mask = edit_result
+            image_src, image_tgt, t2i_mask, clipseg_mask = edit_result
         else:
             image_src, image_tgt = edit_result
             t2i_mask = None
+            clipseg_mask = None
 
         # 7) 转成 (3, 1024, 2048) 的 torch.Tensor
         bundle_src = (
@@ -836,7 +844,10 @@ class kiss3d_wrapper(object):
         )
 
         if return_mask:
-            return bundle_src, bundle_tgt, t2i_mask
+            # 返回两个 mask:
+            # - t2i_mask: T2I attention 生成的 mask
+            # - clipseg_mask: CLIPSeg 原始分辨率 mask
+            return bundle_src, bundle_tgt, t2i_mask, clipseg_mask
         return bundle_src, bundle_tgt
 
 def run_text_to_3d(k3d_wrapper,
@@ -884,7 +895,8 @@ def run_edit_3d_bundle(k3d_wrapper,
                        clipseg_mask_prompt=None,
                        external_mask=None,
                        mask_threshold=0.5,
-                       mask_invert=False):
+                       mask_invert=False,
+                       mask_combine_mode="union"):
     """
     使用 Flux 的 edit 接口，从源提示词 prompt_src 到目标提示词 prompt_tgt，
     生成一对 3D bundle images（源 / 目标），不进行 3D 重建。
@@ -896,12 +908,17 @@ def run_edit_3d_bundle(k3d_wrapper,
         t2i_mask_sigma: 高斯平滑参数
         return_mask: 是否返回生成的 mask
         per_view_mask: 是否为每个视角独立计算 mask
-        clipseg_mask_prompt: CLIPSeg 分割 prompt（如 "hair", "face", "background"）
+        clipseg_mask_prompt: CLIPSeg 分割 prompt，可以是：
+            - 单个字符串: "hair"
+            - 列表: ["hair", "clothes"] 组合多个区域
         external_mask: 直接传入的 mask tensor [1, 1, H, W]
         mask_threshold: CLIPSeg 二值化阈值
         mask_invert: 是否反转 mask
             - False: prompt 区域 mask=1（保持该区域不变）
             - True: prompt 区域 mask=0（编辑该区域）
+        mask_combine_mode: 多个 prompt 的组合方式
+            - "union": 并集（OR），任意 prompt 匹配即保持
+            - "intersection": 交集（AND），所有 prompt 都匹配才保持
 
     返回:
         bundle_src: torch.Tensor, 形状 (3, 1024, 2048), [0., 1.]
@@ -939,15 +956,17 @@ def run_edit_3d_bundle(k3d_wrapper,
         external_mask=external_mask,
         mask_threshold=mask_threshold,
         mask_invert=mask_invert,
+        mask_combine_mode=mask_combine_mode,
     )
     print(f"3d bundle image edit time: {time.time() - start}")
 
     # 解析返回值
     if return_mask:
-        bundle_src, bundle_tgt, t2i_mask = edit_result
+        bundle_src, bundle_tgt, t2i_mask, clipseg_mask = edit_result
     else:
         bundle_src, bundle_tgt = edit_result
         t2i_mask = None
+        clipseg_mask = None
 
     save_path_src = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_3d_bundle_image_src.png')
     save_path_tgt = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_3d_bundle_image_tgt.png')
@@ -961,12 +980,27 @@ def run_edit_3d_bundle(k3d_wrapper,
     logger.info(f"Save target 3D bundle image to {save_path_tgt}")
 
     # 保存 mask 可视化
-    if return_mask and t2i_mask is not None:
+    save_path_t2i_mask = None
+    save_path_clipseg_mask = None
+
+    if return_mask:
         from pipeline.utils_mask import visualize_t2i_mask
-        save_path_mask = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_t2i_mask.png')
-        visualize_t2i_mask(t2i_mask, save_path_mask, original_image=bundle_src)
-        logger.info(f"Save T2I mask to {save_path_mask}")
-        return bundle_src, bundle_tgt, save_path_src, save_path_tgt, t2i_mask, save_path_mask
+
+        # 保存 T2I mask（如果有）
+        if t2i_mask is not None:
+            save_path_t2i_mask = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_t2i_mask.png')
+            visualize_t2i_mask(t2i_mask, save_path_t2i_mask)
+            logger.info(f"Save T2I attention mask to {save_path_t2i_mask}")
+
+        # 保存 CLIPSeg mask（如果有）
+        if clipseg_mask is not None:
+            save_path_clipseg_mask = os.path.join(TMP_DIR, f'{k3d_wrapper.uuid}_edit_clipseg_mask.png')
+            visualize_t2i_mask(clipseg_mask, save_path_clipseg_mask)
+            logger.info(f"Save CLIPSeg mask to {save_path_clipseg_mask}")
+
+        return (bundle_src, bundle_tgt, save_path_src, save_path_tgt,
+                t2i_mask, save_path_t2i_mask,
+                clipseg_mask, save_path_clipseg_mask)
 
     return bundle_src, bundle_tgt, save_path_src, save_path_tgt
 
