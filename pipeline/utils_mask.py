@@ -237,6 +237,7 @@ def visualize_t2i_mask(
     save_path: str,
     original_image: Optional[torch.Tensor] = None,
     overlay_alpha: float = 0.0,
+    save_npy: bool = True,
 ) -> None:
     """
     可视化并保存 T2I mask（带 colorbar 图例）
@@ -280,6 +281,12 @@ def visualize_t2i_mask(
 
     print(f"T2I mask saved to: {save_path}")
 
+    # 保存npy文件
+    if save_npy:
+        npy_path = save_path.rsplit('.', 1)[0] + '.npy'
+        np.save(npy_path, mask_np)
+        print(f"T2I mask npy saved to: {npy_path}")
+
 
 def generate_per_token_heatmaps(
     t2i_attn_cache: Dict[str, torch.Tensor],
@@ -291,6 +298,7 @@ def generate_per_token_heatmaps(
     gaussian_kernel_size: int = 5,
     height: int = 64,
     width: int = 128,
+    save_npy: bool = True,
 ) -> List[str]:
     """
     为每个 text token 生成独立的热力图。
@@ -438,6 +446,12 @@ def generate_per_token_heatmaps(
         plt.close(fig)
         saved_paths.append(save_path)
 
+        # 保存npy文件
+        if save_npy:
+            npy_filename = f"token_{token_idx:03d}_{safe_word}.npy"
+            npy_path = os.path.join(save_dir, npy_filename)
+            np.save(npy_path, mask_np)
+
     print(f"Saved {len(saved_paths)} token heatmaps to {save_dir}")
     return saved_paths
 
@@ -452,6 +466,7 @@ def generate_per_layer_heatmaps(
     gaussian_kernel_size: int = 5,
     height: int = 64,
     width: int = 128,
+    save_npy: bool = True,
 ) -> List[str]:
     """
     为每一层（按间隔）生成独立的热力图，便于分析不同层的 attention 差异。
@@ -574,6 +589,12 @@ def generate_per_layer_heatmaps(
             plt.close(fig)
             saved_paths.append(save_path)
 
+            # 保存npy文件
+            if save_npy:
+                npy_filename = f"layer_{layer_idx:02d}.npy"
+                npy_path = os.path.join(branch_dir, npy_filename)
+                np.save(npy_path, mask_np)
+
         # 生成该分支的全局平均热图（所有层平均）
         all_attn_maps = []
         for layer_idx in range(total_layers):
@@ -635,6 +656,11 @@ def generate_per_layer_heatmaps(
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
             saved_paths.append(save_path)
+
+            # 保存npy文件
+            if save_npy:
+                npy_path = os.path.join(branch_dir, "layer_avg_global.npy")
+                np.save(npy_path, mask_np)
 
         print(f"Saved {branch_name} heatmaps to {branch_dir}")
 
