@@ -1,0 +1,39 @@
+{
+  "rf_gamma": 0.9,
+  "rf_eta": 0.8,
+  "rf_stop": 0.25,
+  "guidance_scale": 3.0,
+  "num_steps": 28,
+  "entries": [
+    {
+      "name": "bottle->building",
+      "bundle_image_path": "test_rf/bottle->building/bundle.png",
+      "prompt_path": "test_rf/bottle->building/prompt.txt",
+      "prompt": "A slender 3D art deco skyscraper with stepped shoulders, frosted cobalt glass facades. No background Arranged in a 2x4 grid with RGB images on top and normal maps below."
+    },
+    {
+      "name": "clay->crystal",
+      "bundle_image_path": "test_rf/clay->crystal/bundle.png",
+      "prompt_path": "test_rf/clay->crystal/prompt.txt",
+      "prompt": "A small 3D tea kettle carved from translucent crystal with mirrored lid, chrome handle, and refracted rainbow edges. No background Arranged in a 2x4 grid with RGB images on top and normal maps below."
+    },
+    {
+      "name": "cozy->sleek",
+      "bundle_image_path": "test_rf/cozy->sleek/bundle.png",
+      "prompt_path": "test_rf/cozy->sleek/prompt.txt",
+      "prompt": "A compact 3D reading pod with a sculpted carbon seat, glass tablet desk, and cyan light strip hovering over suspended holo-novels. No background Arranged in a 2x4 grid with RGB images on top and normal maps below."
+    },
+    {
+      "name": "forest->desert",
+      "bundle_image_path": "test_rf/forest->desert/bundle.png",
+      "prompt_path": "test_rf/forest->desert/prompt.txt",
+      "prompt": "A 3D travel rover armored with sand-hued panels, water canisters, and solar sails folded along the roof rack. No background Arranged in a 2x4 grid with RGB images on top and normal maps below."
+    },
+    {
+      "name": "petal->ember",
+      "bundle_image_path": "test_rf/petal->ember/bundle.png",
+      "prompt_path": "test_rf/petal->ember/prompt.txt",
+      "prompt": "A small 3D phoenix statuette forged from molten ember glass with ember trails and basalt claws. No background Arranged in a 2x4 grid with RGB images on top and normal maps below."
+    }
+  ]
+}
