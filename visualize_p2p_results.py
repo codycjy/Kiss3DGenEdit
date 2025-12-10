@@ -426,12 +426,12 @@ def plot_focused_correlations_ac(comparison_df):
                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
                             edgecolor=corr_color, alpha=0.9))
 
-        ax.annotate(corr_info['interpretation'],
-                   xy=(0.05, 0.05), xycoords='axes fraction',
-                   ha='left', va='bottom', fontsize=9, style='italic',
-                   color='#666666',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='#f8f8f8',
-                            edgecolor='#cccccc', alpha=0.9))
+        # ax.annotate(corr_info['interpretation'],
+        #            xy=(0.05, 0.05), xycoords='axes fraction',
+        #            ha='left', va='bottom', fontsize=9, style='italic',
+        #            color='#666666',
+        #            bbox=dict(boxstyle='round,pad=0.3', facecolor='#f8f8f8',
+        #                     edgecolor='#cccccc', alpha=0.9))
 
         if idx == 0:
             ax.legend(loc='upper left', fontsize=9)
@@ -751,6 +751,61 @@ def plot_category_comparison(summary_df):
     print("  Saved: 10_category_facet_comparison.png")
 
 # ============================================================================
+# Plot 10b: Category Comparison (Right Two Only)
+# ============================================================================
+def plot_category_comparison_right2(summary_df):
+    """Faceted comparison showing only diff_editmode categories"""
+    # Only include the two rightmost categories
+    target_categories = ['diff_editmode_diff_identity', 'diff_editmode_same_identity']
+    filtered_df = summary_df[summary_df['category'].isin(target_categories)]
+
+    if len(filtered_df) == 0:
+        print("  Skipped: 10b_category_facet_right2.png (no matching categories)")
+        return
+
+    categories = [c for c in target_categories if c in filtered_df['category'].unique()]
+
+    fig, axes = plt.subplots(1, len(categories), figsize=(5*len(categories), 5), sharey=True)
+
+    if len(categories) == 1:
+        axes = [axes]
+
+    category_labels = {
+        'diff_editmode_diff_identity': 'Diff Mode, Diff Identity',
+        'diff_editmode_same_identity': 'Diff Mode, Same Identity'
+    }
+
+    for ax, cat in zip(axes, categories):
+        cat_data = filtered_df[filtered_df['category'] == cat]
+
+        # Group by edit mode
+        grouped = cat_data.groupby('edit_mode')['avg_tgt_semantic'].mean()
+
+        modes = grouped.index.tolist()
+        values = grouped.values
+        colors = [COLORS.get(m, '#333333') for m in modes]
+
+        bars = ax.bar([EDIT_MODE_LABELS.get(m, m) for m in modes], values,
+                     color=colors, edgecolor='white', linewidth=1)
+
+        ax.set_title(category_labels.get(cat, cat), fontsize=11, fontweight='bold')
+        ax.set_xlabel('Edit Mode')
+        if ax == axes[0]:
+            ax.set_ylabel('Average Target Semantic (%)')
+
+        # Add value labels
+        for bar, val in zip(bars, values):
+            ax.annotate(f'{val:.1f}', xy=(bar.get_x() + bar.get_width()/2, val),
+                       xytext=(0, 3), textcoords='offset points',
+                       ha='center', va='bottom', fontsize=9)
+
+    fig.suptitle('Category-wise Performance Comparison', fontsize=14, fontweight='bold', y=1.05)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / '10b_category_facet_right2.png')
+    plt.close()
+    print("  Saved: 10b_category_facet_right2.png")
+
+# ============================================================================
 # Main Execution
 # ============================================================================
 def main():
@@ -779,6 +834,7 @@ def main():
     plot_best_params(best_params)
     plot_entry_comparison_bars(comparison_df)
     plot_category_comparison(summary_df)
+    plot_category_comparison_right2(summary_df)
 
     # Summary
     print("\n[3/3] Complete!")
